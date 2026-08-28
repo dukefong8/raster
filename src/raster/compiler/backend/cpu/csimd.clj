@@ -57,11 +57,13 @@
 (defn active-isa
   "The SIMD ISA facet key for the active hardware — the target-aware knob call sites
    use instead of a literal :avx2. Returns :avx512 only when the descriptor is ≥512-bit
-   AND the intrinsics facet actually has that row; else :avx2 (the facet's populated ISA)."
+   AND the intrinsics facet actually has that row; :avx2 on other x86 hosts; nil on
+   architectures without a populated C-intrinsics facet so callers use scalar C."
   []
-  (if (and (>= (long (:vector-bits (hw/active-descriptor) 256)) 512)
-           (get-in in/simd-isa [:avx512 :f32]))
-    :avx512 :avx2))
+  (when (#{"amd64" "x86_64"} (System/getProperty "os.arch"))
+    (if (and (>= (long (:vector-bits (hw/active-descriptor) 256)) 512)
+             (get-in in/simd-isa [:avx512 :f32]))
+      :avx512 :avx2)))
 
 (def ^:dynamic *array-types*
   "Retained array storage element types supplied by AOT binding. Storage width is

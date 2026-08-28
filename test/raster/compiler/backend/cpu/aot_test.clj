@@ -74,6 +74,9 @@
                            reference actual))
               (str function " " dtype " simd=" simd? " length=" length)))))))
 
+(defn- x86-clang-available? []
+  (and (clang-available?)
+       (#{"amd64" "x86_64"} (System/getProperty "os.arch"))))
 ;; ---- kernels under test (proper raster style: rn/ arithmetic, ra/ arrays) ----
 
 ;; int8 output: scaled int8 (narrowing store), exercises byte buffers. Double
@@ -256,7 +259,7 @@
     out))
 
 (deftest cpu-c-simd-reduction
-  (when (clang-available?)
+  (when (x86-clang-available?)
     (testing ":simd? true emits separately rounded vector products and matches the scalar path + interpreter"
       (let [f-simd (aot/compile-aot-c #'rmsnorm-red :double :simd? true)
             f-scal (aot/compile-aot-c #'rmsnorm-red :double)]
@@ -466,7 +469,7 @@
           (is (= (vec (repeat n 2.0)) (vec a))))))))
 
 (deftest cpu-c-simd-map
-  (when (clang-available?)
+  (when (x86-clang-available?)
     (testing ":simd? true emits __m256 store loop for par/map!, matches scalar + interpreter"
       (let [f-simd (aot/compile-aot-c #'axpy-map :float :simd? true)
             f-scal (aot/compile-aot-c #'axpy-map :float)]

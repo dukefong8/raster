@@ -1,7 +1,6 @@
 (ns raster.linalg.qr
-  "QR decomposition via LAPACK dgeqrf + dorgqr.
-
-  Falls back to pure Householder implementation if LAPACK is unavailable.
+  "QR decomposition via LAPACK dgeqrf + dorgqr. Uses LAPACKE when available
+  and direct Fortran LAPACK otherwise.
 
   All matrices are flat double[] in row-major order."
   (:refer-clojure :exclude [aget aset alength aclone])

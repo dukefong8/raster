@@ -146,6 +146,18 @@
     (is (= :dense-packed-reference (:default-strategy dispatch)))
     (is (= :dense-packed-reference (get-in dispatch [:selector :strategy])))))
 
+(defn- clang-supports-opencl-subgroups? []
+  (try
+    (let [probe (str "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
+                     "__kernel void probe(__global half *out) {\n"
+                     "  size_t lane = get_sub_group_local_id();\n"
+                     "  float x = sub_group_reduce_add((float)lane);\n"
+                     "  out[0] = convert_half_rte(x);\n"
+                     "}\n")]
+      (zero? (:exit (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                              "-fsyntax-only" "-" :in probe))))
+    (catch Exception _ false)))
+
 (defn- operation-tree
   [operations]
   (letfn [(children [operation]
@@ -363,29 +375,28 @@
                      plan (assoc-in intel-desc [:cache :slm] 32)))))))
 
 (deftest cooperative-attention-source-is-valid-opencl
-  (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))]
-    (if-not clang?
-      (is true "clang unavailable")
-      (doseq [[physical-route visibility]
-              [[(dense-route) (attention/visibility)]
-               [(dense-route) (csr-visibility)]
-               [(csr-route) (attention/visibility)]
-               [(csr-route) (csr-visibility)]]]
-        (let [source (get-in
-                      (route/route!
-                       (problem :route physical-route :visibility visibility
-                                :qk-head-dim 256 :value-head-dim 256)
-                       {:device-type :gpu :vendor "Intel"
-                        :subgroup-size 16 :max-workgroup-size 256})
-                      [:artifact :source])
-              result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
-                               "-fsyntax-only" "-" :in source)]
-          (is (str/includes? source
-                             "int rstr_value_component_15 = (rstr_lane + 240);"))
-          (is (str/includes? source
-                             "float rstr_weighted_value_result_15 = 0.0f;"))
-          (is (not (str/includes? source "rstr_value_component_16")))
-          (is (zero? (:exit result)) (:err result)))))))
+  (if-not (clang-supports-opencl-subgroups?)
+    (is true "clang lacks the fp16/subgroup OpenCL dialect")
+    (doseq [[physical-route visibility]
+            [[(dense-route) (attention/visibility)]
+             [(dense-route) (csr-visibility)]
+             [(csr-route) (attention/visibility)]
+             [(csr-route) (csr-visibility)]]]
+      (let [source (get-in
+                    (route/route!
+                     (problem :route physical-route :visibility visibility
+                              :qk-head-dim 256 :value-head-dim 256)
+                     {:device-type :gpu :vendor "Intel"
+                      :subgroup-size 16 :max-workgroup-size 256})
+                    [:artifact :source])
+            result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                             "-fsyntax-only" "-" :in source)]
+        (is (str/includes? source
+                           "int rstr_value_component_15 = (rstr_lane + 240);"))
+        (is (str/includes? source
+                           "float rstr_weighted_value_result_15 = 0.0f;"))
+        (is (not (str/includes? source "rstr_value_component_16")))
+        (is (zero? (:exit result)) (:err result))))))
 
 (deftest scheduled-attention-artifacts-preserve-the-abi-across-c-family-targets
   (let [descriptor {:device-type :gpu :subgroup-size 32 :max-workgroup-size 1024}
@@ -567,13 +578,12 @@
             "values that become int literals are rejected before lowering")))))
 
 (deftest tiled-history-sources-cover-route-and-visibility-products
-  (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))
-        desc (assoc intel-desc
+  (let [desc (assoc intel-desc
                     :segmented-weighted-reduction-schedule
                     :subgroup-online-tiled-history
                     :segmented-weighted-reduction-history-tile-size 2)]
-    (if-not clang?
-      (is true "clang unavailable")
+    (if-not (clang-supports-opencl-subgroups?)
+      (is true "clang lacks the fp16/subgroup OpenCL dialect")
       (doseq [[physical-route visibility]
               [[(dense-route) (attention/visibility)]
                [(dense-route) (csr-visibility)]

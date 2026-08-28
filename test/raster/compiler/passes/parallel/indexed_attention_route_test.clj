@@ -38,6 +38,17 @@
                           (nested-operations (or (:else-operations operation) [])))))
           operations))
 
+(defn- clang-supports-opencl-subgroups? []
+  (try
+    (let [probe (str "__kernel void probe(__global float *out) {\n"
+                     "  size_t lane = get_sub_group_local_id();\n"
+                     "  float x = sub_group_reduce_add((float)lane);\n"
+                     "  out[0] = x;\n"
+                     "}\n")]
+      (zero? (:exit (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                              "-fsyntax-only" "-" :in probe))))
+    (catch Exception _ false)))
+
 (defn- plan
   ([] (plan :float))
   ([dtype]
@@ -248,9 +259,8 @@
     (is (= :indexed-segmented-reduction-reference strategy))))
 
 (deftest score-reuse-source-is-valid-opencl
-  (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))]
-    (if-not clang?
-      (is true "clang unavailable")
+  (if-not (clang-supports-opencl-subgroups?)
+    (is true "clang lacks the subgroup OpenCL dialect")
       (let [source (get-in
                     (swr-route/route-dynamic!
                      (plan) {:device-type :gpu
@@ -261,7 +271,7 @@
                     [:artifact :source])
             result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                              "-fsyntax-only" "-" :in source)]
-        (is (zero? (:exit result)) (:err result))))))
+        (is (zero? (:exit result)) (:err result)))))
 
 (deftest route-declines-unproved-semantics-and-unresolved-shapes
   (testing "a different scalar region cannot silently enter the specialized leaf"

@@ -376,7 +376,8 @@ src/raster/
 - **OpenCL** (optional) — for GPU computing
 - Dependencies resolve automatically via `deps.edn`
 
-For Valhalla value types (Dual, Float16), use JDK 27 early-access.
+For Valhalla value types (Dual, Float16), use a preview-enabled Valhalla JDK
+(JDK 28 early-access is supported).
 
 ## Running
 
@@ -387,14 +388,18 @@ clojure -M:test
 # REPL
 clojure -M:nREPL
 
-# With Valhalla JDK 27 (point JAVA_HOME at your local Valhalla build)
-export JAVA_HOME=/path/to/valhalla-jdk/build/linux-x86_64-server-release/images/jdk
+# With a preview-enabled JDK 27+ (for example, a JDK 28 EA build)
+export JAVA_HOME=/path/to/jdk
 export PATH="$JAVA_HOME/bin:$PATH"
 clojure -J--enable-preview \
         -J--add-exports=java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
         -J--enable-native-access=ALL-UNNAMED \
         -M:test:valhalla
 ```
+
+JVMCI inspection is separate because stock JDK 27+ no longer ships
+`jdk.internal.vm.ci`. On JDK 26 or a downstream JVMCI-enabled build, add the
+`:jvmci` alias explicitly.
 
 ## Documentation
 

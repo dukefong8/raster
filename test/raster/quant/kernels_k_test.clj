@@ -22,6 +22,10 @@
       (.waitFor p) (zero? (.exitValue p)))
     (catch Exception _ false)))
 
+(defn- x86-clang-available? []
+  (and (clang-available?)
+       (#{"amd64" "x86_64"} (System/getProperty "os.arch"))))
+
 (defn- gen [n seed]
   (let [a (float-array n) r (java.util.Random. seed)]
     (dotimes [i n] (aset a i (float (- (.nextDouble r) 0.5)))) a))
@@ -62,7 +66,7 @@
     (dotimes [k in] (aset d k (float (* dact (aget ^bytes xq k))))) d))
 
 (deftest q4k-composable-c
-  (when (clang-available?)
+  (when (x86-clang-available?)
     (testing "composable Q4_K GEMV → C matches dequant-matmul"
       (let [out 8 in 256
             W (gen (* out in) 1) x (gen in 2)

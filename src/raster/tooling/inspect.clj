@@ -17,7 +17,7 @@
     (print-compiler-directives)
     (clear-compiler-directives!)
 
-  JVMCI (needs --add-modules jdk.internal.vm.ci, included in :valhalla alias):
+  JVMCI (JDK 26 or a downstream JVMCI-enabled build; use the :jvmci alias):
     (compilation-state #'my-fn)            ; check compilation tiers
     (compilation-state SomeClass \"invoke\") ; check by class + method name
     (native-disassemble #'my-fn)           ; disassemble native code (needs hsdis)
@@ -290,7 +290,9 @@
     true
     (catch ClassNotFoundException _
       (throw (ex-info
-              (str "JVMCI not available. Start REPL with :valhalla alias, or add:\n"
+              (str "JVMCI not available. Stock JDK 27+ removed jdk.internal.vm.ci.\n"
+                   "Use JDK 26 or a downstream JVMCI-enabled build with the :jvmci alias,\n"
+                   "or add these options explicitly:\n"
                    "  --add-modules jdk.internal.vm.ci\n"
                    "  --add-exports jdk.internal.vm.ci/jdk.vm.ci.hotspot=ALL-UNNAMED\n"
                    "  --add-exports jdk.internal.vm.ci/jdk.vm.ci.meta=ALL-UNNAMED\n"

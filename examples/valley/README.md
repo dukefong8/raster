@@ -26,7 +26,12 @@ history.)
 
 **JVM (Vulkan):**
 ```bash
+# Linux x64
 clojure -M:vulkan -m valley.vk-walk
+
+# macOS / Apple Silicon with JDK 28 preview features
+JAVA_HOME=/path/to/jdk-28.jdk/Contents/Home \
+  clojure -M:vulkan:vulkan-macos-arm64:valhalla -m valley.vk-walk
 ```
 
 **Browser (WebGPU — Chrome/Edge; Firefox needs a flag):**

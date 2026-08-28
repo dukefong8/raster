@@ -103,6 +103,15 @@
                         org.replikativ/datahike {:mvn/version "0.8.1671"}
                         http-kit/http-kit {:mvn/version "2.8.0"}}
            :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+  :vulkan-macos-arm64
+  {:extra-deps {org.lwjgl/lwjgl$natives-macos-arm64 {:mvn/version "3.4.1"}
+                org.lwjgl/lwjgl-glfw$natives-macos-arm64 {:mvn/version "3.4.1"}
+                org.lwjgl/lwjgl-vulkan$natives-macos-arm64 {:mvn/version "3.4.1"}
+                org.lwjgl/lwjgl-vma$natives-macos-arm64 {:mvn/version "3.4.1"}
+                org.lwjgl/lwjgl-shaderc$natives-macos-arm64 {:mvn/version "3.4.1"}
+                org.lwjgl/lwjgl-stb$natives-macos-arm64 {:mvn/version "3.4.1"}
+                org.lwjgl/lwjgl-openal$natives-macos-arm64 {:mvn/version "3.4.1"}}
+   :jvm-opts ["-XstartOnFirstThread"]}
   :demo {:extra-paths ["demo"]
          :extra-deps {cljfx/cljfx {:mvn/version "1.10.6"}
                       org.openjfx/javafx-controls {:mvn/version "24"}
@@ -123,13 +132,14 @@
                         "--add-exports" "java.base/jdk.internal.vm.annotation=ALL-UNNAMED"
                         "--add-exports" "java.base/jdk.internal.classfile.components=ALL-UNNAMED"
                         "--add-exports" "java.base/jdk.internal.classfile.impl=ALL-UNNAMED"
-                        "--add-modules" "jdk.incubator.vector"
-                        ;; JVMCI — programmatic access to JIT compilation state
-                        "--add-modules" "jdk.internal.vm.ci"
-                        "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.hotspot=ALL-UNNAMED"
-                        "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.meta=ALL-UNNAMED"
-                        "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.runtime=ALL-UNNAMED"
-                        "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.code=ALL-UNNAMED"
-                        "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.services=ALL-UNNAMED"
-                        ;; Open hotspot package for reflection (CompilerToVM is package-private)
-                        "--add-opens" "jdk.internal.vm.ci/jdk.vm.ci.hotspot=ALL-UNNAMED"]}}}
+                        "--add-modules" "jdk.incubator.vector"]}
+  ;; JVMCI was removed from stock JDK 27+. Use this profile only with JDK 26 or
+  ;; a downstream JDK that still provides jdk.internal.vm.ci.
+  :jvmci {:jvm-opts ["--add-modules" "jdk.internal.vm.ci"
+                      "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.hotspot=ALL-UNNAMED"
+                      "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.meta=ALL-UNNAMED"
+                      "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.runtime=ALL-UNNAMED"
+                      "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.code=ALL-UNNAMED"
+                      "--add-exports" "jdk.internal.vm.ci/jdk.vm.ci.services=ALL-UNNAMED"
+                      ;; Open hotspot package for reflection (CompilerToVM is package-private)
+                      "--add-opens" "jdk.internal.vm.ci/jdk.vm.ci.hotspot=ALL-UNNAMED"]}}}

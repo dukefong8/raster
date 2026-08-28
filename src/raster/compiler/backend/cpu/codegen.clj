@@ -74,16 +74,22 @@
 (def ^:private cache-dir (let [d (io/file (System/getProperty "java.io.tmpdir") "raster-cpu-kernels")]
                            (.mkdirs d) (.getAbsolutePath d)))
 
+(def ^:private linux? (= "Linux" (System/getProperty "os.name")))
+
 (def ^:private cflags
   "Preserve source floating-point operations, including NaNs and signed zero.
   Reassociation and contraction require explicit numerical permission in the
   lowering; they are not a property of selecting the native backend. Explicit
   SIMD/FMA intrinsics selected by a legal schedule remain available. These flags
-  participate in compiler-identity, invalidating older fast-math artifacts."
-  ["-O3" "-march=native" "-funroll-loops" "-ffp-contract=off" "-fveclib=libmvec"
-   "-shared" "-fPIC"])
+  participate in compiler-identity, invalidating older fast-math artifacts.
+  On Linux, -fveclib=libmvec is added (glibc vector math); it does not exist
+  on macOS."
+  (cond-> ["-O3" "-march=native" "-funroll-loops" "-ffp-contract=off"
+           "-shared" "-fPIC"]
+    linux? (conj "-fveclib=libmvec")))
 
-(def ^:private link-libs ["-lmvec" "-lm"])
+(def ^:private link-libs
+  (if linux? ["-lmvec" "-lm"] ["-lm"]))
 
 (def ^:private cache-schema :raster.cpu-native-cache/v2)
 

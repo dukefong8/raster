@@ -134,7 +134,11 @@
   "True if JDK supports Valhalla value classes (JDK 27+ with --enable-preview)."
   (try
     (Class/forName "java.lang.classfile.ClassFile")
-    (>= (.feature (Runtime/version)) 27)
+    (and (>= (.feature (Runtime/version)) 27)
+         (boolean
+          (some #{"--enable-preview"}
+                (.getInputArguments
+                 (java.lang.management.ManagementFactory/getRuntimeMXBean)))))
     (catch ClassNotFoundException _ false)))
 
 (deftest defvalue-test

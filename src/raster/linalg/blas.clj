@@ -1,5 +1,5 @@
 (ns raster.linalg.blas
-  "Panama FFI bindings to CBLAS (MKL preferred, OpenBLAS fallback).
+  "Panama FFI bindings to CBLAS (MKL preferred, OpenBLAS/Accelerate fallback).
 
   Uses ordinary JDK Foreign Function & Memory downcalls with shared runtime
   ownership. Heap arrays are staged; batched calls stage once for the whole batch.
@@ -42,6 +42,9 @@
 
 (def ^:private openblas-paths
   native-library/openblas-paths)
+
+(def ^:private accelerate-paths
+  ["/System/Library/Frameworks/Accelerate.framework/Accelerate"])
 
 (defn- try-load-lib
   "Attempt to load a shared library from a list of paths.
@@ -130,6 +133,12 @@
     (when-let [lib (:lookup selected)]
       [lib :openblas (dissoc selected :lookup)])))
 
+(defn- try-load-accelerate []
+  (when-let [[lib path] (try-load-lib accelerate-paths)]
+    (when (.isPresent (.find lib "cblas_dgemm"))
+      [lib :accelerate {:status :selected :source :accelerate :path path
+                        :required-symbol "cblas_dgemm"}])))
+
 (defn- find-blas []
   ;; First check if cblas symbols are already available (e.g. loaded by
   ;; Neanderthal's JNI OpenBLAS). This avoids loading a second library
@@ -140,9 +149,11 @@
       (if (.isPresent (.find loader "cblas_dgemm"))
         [loader :preloaded {:status :selected :source :preloaded
                            :required-symbol "cblas_dgemm"}]
-        ;; Try MKL first (with sequential threading), then OpenBLAS
+        ;; Try MKL first (with sequential threading), then OpenBLAS,
+        ;; then macOS Accelerate.
         (or (try-load-mkl)
-            (try-load-openblas nil))))))
+            (try-load-openblas nil)
+            (try-load-accelerate))))))
 
 ;; Lazy — only loads library on first deref
 (def ^:private blas-state
@@ -158,7 +169,7 @@
              [library backend (merge details evidence {:backend backend})]))))
 
 (defn backend
-  "Returns the active BLAS backend: :mkl, :openblas, :preloaded, or nil if unavailable."
+  "Returns the active BLAS backend, or nil if unavailable."
   []
   (second @blas-state))
 
@@ -173,7 +184,8 @@
   (when-not @blas-state
     (throw (ex-info "No BLAS library found. Install Intel MKL or OpenBLAS."
                     {:searched-mkl mkl-paths
-                     :searched-openblas openblas-paths}))))
+                     :searched-openblas openblas-paths
+                     :searched-accelerate accelerate-paths}))))
 
 ;; ================================================================
 ;; Ordinary native calls with explicit pointer access

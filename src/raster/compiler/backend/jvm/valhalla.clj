@@ -18,9 +18,12 @@
   (try
     (Class/forName "java.lang.classfile.ClassFile")
     ;; ClassFile API exists; now check if value classes are actually supported
-    ;; by verifying JDK version >= 27 (Valhalla preview)
-    (let [version (.feature (Runtime/version))]
-      (>= version 27))
+    ;; and preview classfiles are enabled for this JVM invocation.
+    (let [version (.feature (Runtime/version))
+          jvm-args (.getInputArguments
+                    (java.lang.management.ManagementFactory/getRuntimeMXBean))]
+      (and (>= version 27)
+           (boolean (some #{"--enable-preview"} jvm-args))))
     (catch ClassNotFoundException _ false)))
 
 ;; ================================================================
@@ -122,8 +125,9 @@
                     (accept [_ cb]
                  ;; Class flags: PUBLIC + FINAL (no ACC_IDENTITY = value class)
                       (.withFlags cb (int 0x0011))
-                 ;; Version 71.65535 (JDK 27 preview)
-                      (.withVersion cb 71 65535)
+                 ;; Preview classfiles are only loadable by the exact JDK release
+                 ;; that generated them (JDK feature N uses major version N + 44).
+                      (.withVersion cb (+ 44 (.feature (Runtime/version))) 65535)
                  ;; Interfaces: user-specified + ILookup
                       (let [all-ifaces (into (vec interfaces) [ilookup-desc])]
                         (.withInterfaceSymbols cb (into-array ClassDesc all-ifaces)))
@@ -313,14 +317,18 @@
               bytes (generate-value-class-bytes class-name field-specs :interfaces interfaces)]
           (try
             (.defineClass ^clojure.lang.DynamicClassLoader loader class-name bytes nil)
-            (catch LinkageError _
-              ;; Class already defined in this loader (parametric cascading) — return existing.
-              ;; This is expected during parametric specialization where multiple templates
-              ;; reference the same defvalue type.
-              (when (System/getProperty "raster.debug")
-                (binding [*out* *err*]
-                  (println (str "DEBUG: value class already defined: " class-name))))
-              (Class/forName class-name true loader))))))))
+            (catch LinkageError e
+              ;; A duplicate definition is expected during parametric cascading. Do
+              ;; not mask other linkage failures (for example, a bad class version)
+              ;; as a misleading ClassNotFoundException.
+              (try
+                (let [existing (Class/forName class-name true loader)]
+                  (when (System/getProperty "raster.debug")
+                    (binding [*out* *err*]
+                      (println (str "DEBUG: value class already defined: " class-name))))
+                  existing)
+                (catch ClassNotFoundException _
+                  (throw e))))))))))
 
 (when-not valhalla-available?
   (defn load-value-class!

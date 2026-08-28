@@ -67,7 +67,7 @@
       ;; sum loss), so absolute 3e-3 would reject finite-diff truncation noise
       (letfn [(ok? [a n] (< (Math/abs (- a n)) (+ 5e-3 (* 5e-3 (Math/abs n)))))]
         (doseq [i [0 5 40]] (is (ok? (double (aget ^floats gG i)) (fdf f G i 1e-3)) (str "dG[" i "]")))
-        (doseq [i [0 20]]   (is (ok? (double (aget ^floats gU i)) (fdf f U i 1e-3)) (str "dU[" i "]")))
+        (doseq [i [0 20]]   (is (ok? (double (aget ^floats gU i)) (fdf f U i 1e-2)) (str "dU[" i "]")))
         (doseq [i [0 30]]   (is (ok? (double (aget ^floats gD i)) (fdf f D i 1e-3)) (str "dD[" i "]")))))))
 
 ;; ---- GQA / MQA causal attention ----

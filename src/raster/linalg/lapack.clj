@@ -1,8 +1,8 @@
 (ns raster.linalg.lapack
-  "Panama FFI bindings to LAPACK via OpenBLAS.
+  "Panama FFI bindings to LAPACK via OpenBLAS or macOS Accelerate.
 
   SVD and eigendecomposition use Fortran LAPACK direct (dgesdd_, dsyevd_).
-  QR uses LAPACKE C wrapper (small matrices in randomized SVD).
+  QR prefers the LAPACKE C wrapper and falls back to Fortran LAPACK direct.
 
   For SVD, row-major input is transposed to column-major before calling
   dgesdd_ with original (m,n) dimensions. This ensures LAPACK's optimized
@@ -33,7 +33,8 @@
 ;; ================================================================
 
 (def ^:private lib-paths
-  native-library/openblas-paths)
+  (conj native-library/openblas-paths
+        "/System/Library/Frameworks/Accelerate.framework/Accelerate"))
 
 (def ^:private lapacke-lib-paths
   ["/usr/lib/x86_64-linux-gnu/liblapacke.so"
@@ -127,29 +128,35 @@
 (def ^:private get-threads-fd
   (FunctionDescriptor/of ValueLayout/JAVA_INT (into-array MemoryLayout [])))
 
-(defn- make-handle-noncritical
+(defn- maybe-handle-noncritical
   [^SymbolLookup lib ^String symbol-name ^FunctionDescriptor fd]
-  (.downcallHandle (Linker/nativeLinker)
-                   (lookup-symbol lib symbol-name)
-                   fd
-                   (into-array Linker$Option [])))
+  (when lib
+    (when-let [address (.orElse (.find lib symbol-name) nil)]
+      (.downcallHandle (Linker/nativeLinker)
+                       address
+                       fd
+                       (into-array Linker$Option [])))))
 
 (def ^:private set-threads-mh
-  (delay (make-handle-noncritical (:lookup @openblas) "openblas_set_num_threads" set-threads-fd)))
+  (delay (maybe-handle-noncritical (:lookup @openblas) "openblas_set_num_threads" set-threads-fd)))
 
 (def ^:private get-threads-mh
-  (delay (make-handle-noncritical (:lookup @openblas) "openblas_get_num_threads" get-threads-fd)))
+  (delay (maybe-handle-noncritical (:lookup @openblas) "openblas_get_num_threads" get-threads-fd)))
 
 (defn get-num-threads
-  "Get current OpenBLAS thread count."
+  "Get the OpenBLAS thread count, or 1 when the backend has no thread-control API."
   ^long []
-  (long (.invokeWithArguments ^java.lang.invoke.MethodHandle @get-threads-mh [])))
+  (if-let [mh ^java.lang.invoke.MethodHandle @get-threads-mh]
+    (long (.invokeWithArguments mh []))
+    1))
 
 (defn set-num-threads!
   "Set OpenBLAS thread count. For LAPACK on modern CPUs,
-  half the physical cores often outperforms using all cores."
+  half the physical cores often outperforms using all cores. No-op on backends
+  without the OpenBLAS thread-control API."
   [^long n]
-  (.invokeWithArguments ^java.lang.invoke.MethodHandle @set-threads-mh [(int n)]))
+  (when-let [mh ^java.lang.invoke.MethodHandle @set-threads-mh]
+    (.invokeWithArguments mh [(int n)])))
 
 (defn optimize-threads!
   "Set OpenBLAS threads to half the available processors (min 1, max 4).
@@ -345,27 +352,64 @@
 
 (def ^:private ^:const LAPACK_ROW_MAJOR (int 101))
 
-(def ^:private dgeqrf-fd
+(def ^:private lapacke-dgeqrf-fd
   (FunctionDescriptor/of
    ValueLayout/JAVA_INT
    (into-array MemoryLayout
                [ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
                 ValueLayout/ADDRESS  ValueLayout/JAVA_INT ValueLayout/ADDRESS])))
 
-(def ^:private dgeqrf-mh
-  (delay (make-handle (:lookup @lapacke) "LAPACKE_dgeqrf" dgeqrf-fd
+(def ^:private lapacke-dgeqrf-mh
+  (delay (make-handle (:lookup @lapacke) "LAPACKE_dgeqrf" lapacke-dgeqrf-fd
                       [:read-write :write])))
 
+(def ^:private fortran-dgeqrf-fd
+  (FunctionDescriptor/ofVoid
+   (into-array MemoryLayout (repeat 8 ValueLayout/ADDRESS))))
+
+(def ^:private fortran-dgeqrf-mh
+  (delay (make-handle (:lookup @openblas) "dgeqrf_" fortran-dgeqrf-fd
+                      [:read :read :read-write :read :write :read-write :read :write])))
+
+(defn- dgeqrf-fortran!
+  [^doubles A ^doubles tau ^long m ^long n]
+  (let [_ @_init
+        A-col (double-array (* m n))
+        m-seg (int-seg m)
+        n-seg (int-seg n)
+        lda-seg (int-seg m)
+        info-out (int-array 1)
+        info-seg (MemorySegment/ofArray info-out)
+        query (double-array 1)
+        mh @fortran-dgeqrf-mh]
+    (transpose-to-col! A A-col m n)
+    (invoke-native! mh
+                    [m-seg n-seg (MemorySegment/ofArray A-col) lda-seg
+                     (MemorySegment/ofArray tau) (MemorySegment/ofArray query)
+                     (int-seg -1) info-seg])
+    (if-not (zero? (aget info-out 0))
+      (long (aget info-out 0))
+      (let [lwork (max 1 (long (Math/ceil (aget query 0))))
+            work (double-array lwork)]
+        (invoke-native! mh
+                        [m-seg n-seg (MemorySegment/ofArray A-col) lda-seg
+                         (MemorySegment/ofArray tau) (MemorySegment/ofArray work)
+                         (int-seg lwork) info-seg])
+        (transpose-to-row! A-col A m n)
+        (long (aget info-out 0))))))
+
 (deftm dgeqrf!
-  "QR factorization via LAPACKE (row-major). A[m,n] overwritten with
+  "QR factorization via LAPACKE or Fortran LAPACK. A[m,n] overwritten with
   R (upper) and Householder reflectors (lower). tau[min(m,n)]."
   [A :- (Array double) tau :- (Array double) m :- Long n :- Long] :- Long
-  (long (invoke-native! @dgeqrf-mh
-                              [LAPACK_ROW_MAJOR (int m) (int n)
-                               (MemorySegment/ofArray A) (int n)
-                               (MemorySegment/ofArray tau)])))
+  (if (:lookup @lapacke)
+    (long (invoke-native! @lapacke-dgeqrf-mh
+                          [LAPACK_ROW_MAJOR (int m) (int n)
+                           (MemorySegment/ofArray A) (int n)
+                           (MemorySegment/ofArray tau)]))
+    (dgeqrf-fortran! A tau m n)))
 
-(def ^:private dorgqr-fd
+(def ^:private lapacke-dorgqr-fd
   (FunctionDescriptor/of
    ValueLayout/JAVA_INT
    (into-array MemoryLayout
@@ -373,18 +417,56 @@
                 ValueLayout/JAVA_INT ValueLayout/ADDRESS  ValueLayout/JAVA_INT
                 ValueLayout/ADDRESS])))
 
-(def ^:private dorgqr-mh
-  (delay (make-handle (:lookup @lapacke) "LAPACKE_dorgqr" dorgqr-fd
+(def ^:private lapacke-dorgqr-mh
+  (delay (make-handle (:lookup @lapacke) "LAPACKE_dorgqr" lapacke-dorgqr-fd
                       [:read-write :read])))
 
+(def ^:private fortran-dorgqr-fd
+  (FunctionDescriptor/ofVoid
+   (into-array MemoryLayout (repeat 9 ValueLayout/ADDRESS))))
+
+(def ^:private fortran-dorgqr-mh
+  (delay (make-handle (:lookup @openblas) "dorgqr_" fortran-dorgqr-fd
+                      [:read :read :read :read-write :read :read :read-write :read :write])))
+
+(defn- dorgqr-fortran!
+  [^doubles A ^doubles tau m n k]
+  (let [_ @_init
+        A-col (double-array (* m n))
+        m-seg (int-seg m)
+        n-seg (int-seg n)
+        k-seg (int-seg k)
+        lda-seg (int-seg m)
+        info-out (int-array 1)
+        info-seg (MemorySegment/ofArray info-out)
+        query (double-array 1)
+        mh @fortran-dorgqr-mh]
+    (transpose-to-col! A A-col m n)
+    (invoke-native! mh
+                    [m-seg n-seg k-seg (MemorySegment/ofArray A-col) lda-seg
+                     (MemorySegment/ofArray tau) (MemorySegment/ofArray query)
+                     (int-seg -1) info-seg])
+    (if-not (zero? (aget info-out 0))
+      (long (aget info-out 0))
+      (let [lwork (max 1 (long (Math/ceil (aget query 0))))
+            work (double-array lwork)]
+        (invoke-native! mh
+                        [m-seg n-seg k-seg (MemorySegment/ofArray A-col) lda-seg
+                         (MemorySegment/ofArray tau) (MemorySegment/ofArray work)
+                         (int-seg lwork) info-seg])
+        (transpose-to-row! A-col A m n)
+        (long (aget info-out 0))))))
+
 (deftm dorgqr!
-  "Generate thin Q[m,n] from Householder reflectors via LAPACKE (row-major)."
+  "Generate thin Q[m,n] from Householder reflectors via LAPACKE or Fortran LAPACK."
   [A :- (Array double) tau :- (Array double)
    m :- Long n :- Long k :- Long] :- Long
-  (long (invoke-native! @dorgqr-mh
-                              [LAPACK_ROW_MAJOR (int m) (int n) (int k)
-                               (MemorySegment/ofArray A) (int n)
-                               (MemorySegment/ofArray tau)])))
+  (if (:lookup @lapacke)
+    (long (invoke-native! @lapacke-dorgqr-mh
+                          [LAPACK_ROW_MAJOR (int m) (int n) (int k)
+                           (MemorySegment/ofArray A) (int n)
+                           (MemorySegment/ofArray tau)]))
+    (dorgqr-fortran! A tau m n k)))
 
 ;; ================================================================
 ;; Thread & availability API

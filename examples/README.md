@@ -38,13 +38,23 @@ Also: [Reaction-Diffusion](reaction_diffusion/) — Gray-Scott pattern formation
 clojure -Sdeps '{:paths ["src" "examples"]}' -M:vulkan -m <entry-point>
 ```
 
+On Apple Silicon, add the macOS native profile (and `:valhalla` when running a
+preview-enabled JDK for the value-type fast paths):
+
+```bash
+JAVA_HOME=/path/to/jdk-28.jdk/Contents/Home \
+  clojure -Sdeps '{:paths ["src" "examples"]}' \
+  -M:vulkan:vulkan-macos-arm64:valhalla -m <entry-point>
+```
+
 Entry points:
 - Asteroids (Vulkan): `-m asteroids.vk-main` — or `-m asteroids.jvm` for a no-native-deps Swing window
 - Doom: `-m doom.run`
 - Valley (Vulkan): `-m valley.vk-walk`
 
-(The `:vulkan` alias pulls in the LWJGL dependencies. The Valhalla JDK is optional —
-needed only for the `Dual4` value-type fast paths, not for the games.)
+(The `:vulkan` alias pulls in LWJGL and Linux natives; `:vulkan-macos-arm64`
+adds Apple Silicon natives and the required first-thread launch option. The
+Valhalla profile is optional—needed only for value-type fast paths, not for the games.)
 
 ### Architecture
 

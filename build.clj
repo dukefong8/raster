@@ -457,15 +457,58 @@
     (io/make-parents file)
     (spit file valley-main-source)))
 
+(def aot-explain-file
+  "Stage-by-stage explain-pipeline report for every Valley deftm kernel, written by
+  `valley-uber` (via `explain-kernels-form`)."
+  "target/valley-aot-explain.txt")
+
+(defn- explain-kernels-form
+  "Quoted form run inside the AOT subprocess: after the game is loaded from source (which
+  populates the deftm registry) and before anything is compiled, write a stage-by-stage
+  `explain-pipeline` report for every deftm kernel to `aot-explain-file`.
+
+  The kernels are found by their dispatch-table metadata, so the report follows the code:
+  add a deftm and it appears; a kernel that cannot be explained is recorded in the report
+  rather than failing the build."
+  []
+  `(let [kernels# (->> '~valley-source-only
+                       (mapcat (comp vals ns-interns the-ns))
+                       (filter (fn [v#] (:raster.core/dispatch-table (meta v#))))
+                       (sort-by str))
+         runs# (mapv (fn [v#]
+                       (try
+                         [v# (with-out-str
+                               ((requiring-resolve 'raster.compiler.pipeline/explain-pipeline)
+                                v#))
+                          nil]
+                         (catch Throwable e#
+                           [v# nil (.getMessage e#)])))
+                     kernels#)]
+     (when (empty? kernels#)
+       (throw (ex-info "no Valley deftm kernels found — the explain report would be empty"
+                       {:namespaces '~valley-source-only})))
+     (spit ~aot-explain-file
+           (apply str (interpose "\n\n"
+                                 (map (fn [[v# text# err#]]
+                                        (str "=== " v# " ===\n"
+                                             (or text# (str "(explain failed: " err# ")"))))
+                                      runs#))))
+     (println "explain:" (count kernels#) "kernels →" ~aot-explain-file)
+     (doseq [[v# ~'_ err#] runs# :when err#]
+       (println "  explain FAILED:" (str v#) "-" err#))))
+
 (defn- aot-valley!
   "Compile `valley-aot-targets` into `valley-class-dir` via a subprocess on the
   valley-aware classpath: load everything from source first (compilation off), then
   compile only the targets — see `valley-aot-targets`. raster comes from the lean jar,
-  so the AOT pass also checks that the lean closure genuinely covers the game."
+  so the AOT pass also checks that the lean closure genuinely covers the game.
+  Before compiling, the subprocess writes the per-kernel explain-pipeline report
+  (`aot-explain-file`)."
   []
   (let [script (pr-str `(do
                           (require ~@(map (fn [s] (list 'quote s))
                                           (concat valley-source-only valley-aot-targets)))
+                          ~(explain-kernels-form)
                           (binding [*compile-path* ~(str valley-class-dir)]
                             (doseq [~'n '~valley-aot-targets]
                               (compile ~'n)))
@@ -487,6 +530,8 @@
   "Build target/valley.jar: AOT-compiled Valley + all deps (LWJGL natives included),
   entry valley-aot-main. raster itself is packaged from `lean-jar-file` — the jar does
   not contain the compute-GPU/ABM/ODE/… source outside the lean closure.
+  Also writes `aot-explain-file`: the explain-pipeline lowering report for every
+  Valley deftm kernel.
   Run:  java -jar target/valley.jar"
   [_]
   (ensure-lean-jar!)

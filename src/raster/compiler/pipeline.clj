@@ -552,6 +552,21 @@
               (not= ns-str "raster.par")
               (not= ns-str "raster.ad.reverse")))))
 
+(defn- value-ctor-factory-call?
+  "True if form is a `(->Type …)` call to a defvalue-generated factory.
+  These factories are plain defns carrying :raster.core/return-tag (no dispatch
+  table), and the JVM backend lowers them directly to `new Type(…)`
+  (bytecode.clj's factory special case) — so a surviving call is NOT an
+  IFn.invoke fallback and must not be reported as an undevirtualized dispatch."
+  [form]
+  (and (seq? form)
+       (symbol? (first form))
+       (let [n (name (first form))]
+         (and (.startsWith ^String n "->")
+              (> (count n) 2)
+              (when-let [v (resolve (first form))]
+                (some? (:raster.core/return-tag (meta v))))))))
+
 (defn- count-undevirtualized
   "Count remaining undevirtualized dispatch calls in a form."
   [form]
@@ -744,14 +759,19 @@
           ;; Warn about surviving undevirtualized calls — on CPU these fall back to
           ;; slow IFn.invoke (270ns dispatch vs 4ns .invk); on GPU they CANNOT lower
           ;; to C and produce garbage. Name the ops so the type-inference gap is
-          ;; findable.
-          surviving (collect-undevirtualized resolved)
+          ;; findable. Value-ctor factories (->Type) are excluded on CPU only: the
+          ;; JVM backend lowers them directly to `new Type(…)` (factory special
+          ;; case), so they are not fallbacks — on GPU a surviving call is still
+          ;; a miscompile hazard.
+          gpu-target? (device/gpu-target? (:target-device opts))
+          surviving (cond->> (collect-undevirtualized resolved)
+                      (not gpu-target?) (remove value-ctor-factory-call?))
           remaining (count surviving)
           op-freq (frequencies (map first surviving))
           examples (mapv (fn [f] (let [s (pr-str f)] (subs s 0 (min 200 (count s)))))
                          (take 3 (distinct surviving)))]
       (when (pos? remaining)
-        (if (device/gpu-target? (:target-device opts))
+        (if gpu-target?
           ;; GPU cannot fall back to IFn.invoke — a surviving dispatch emits a call
           ;; to a nonexistent OpenCL function → silent garbage output. Fail loud so
           ;; a mistyped kernel (e.g. double literals/params in a float kernel) is a

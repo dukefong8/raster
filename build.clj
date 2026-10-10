@@ -460,7 +460,7 @@
 (def aot-explain-file
   "Stage-by-stage explain-pipeline report for every Valley deftm kernel, written by
   `valley-uber` (via `explain-kernels-form`)."
-  "target/valley-aot-explain.txt")
+  "target/aot-explain.txt")
 
 (defn- explain-kernels-form
   "Quoted form run inside the AOT subprocess: after the game is loaded from source (which

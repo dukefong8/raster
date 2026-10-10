@@ -114,7 +114,7 @@
   {:doc "Build the AOT uberjar target/valley.jar (Valley + all deps).
          AOT-compiles the valley namespaces and bundles the LWJGL
          natives; the macOS entry re-execs with -XstartOnFirstThread.
-         Also writes target/valley-aot-explain.txt — the
+         Also writes target/aot-explain.txt — the
          explain-pipeline lowering report for every Valley deftm kernel.
          Run:  java -jar target/valley.jar"
    :task (do

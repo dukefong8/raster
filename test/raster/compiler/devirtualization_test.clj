@@ -10,11 +10,14 @@
   This would have caught the TC-source-ns hole (optimize-layout! went 0→19
   dispatched when TC ran in the wrong namespace)."
   (:require [clojure.test :refer [deftest testing is]]
+            [raster.core :refer [deftm]]
+            [raster.linalg.core :refer [->Vec2]]
             [raster.tooling.inspect :as inspect]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.diffusion :as diffusion]
             [raster.dl.optim :as optim]
-            [raster.spatial.nndescent :as nnd]))
+            [raster.spatial.nndescent :as nnd])
+  (:import [raster.linalg.core Vec2]))
 
 ;; NOTE: the UMAP-layer devirt cases (optimize-layout-chunk!, graph kernels) moved
 ;; to the umap-rstr library's test suite when UMAP was factored out. This gate now
@@ -99,3 +102,29 @@
               (str v " has " dispatched " undevirtualized dispatch op(s) — a "
                    "raster.numeric op over a clojure.core arithmetic result lost its "
                    "operand tag (infer-rewritten-tag scalar-op gap)")))))))
+
+;; ================================================================
+;; Value-ctor factories are backend-lowered, not runtime dispatch
+;; ================================================================
+
+(deftm uw-vec2-factory-probe
+  [x :- Double y :- Double] :- Vec2
+  (->Vec2 x y))
+
+(deftest value-ctor-factory-calls-are-not-undevirtualized
+  (testing "(->Type …) factory calls do not trip the CPU undevirtualized diagnostic"
+    ;; The JVM backend lowers defvalue factory calls directly to `new Type(…)`
+    ;; (bytecode.clj factory special case), so a surviving `(->Vec2 …)` is not an
+    ;; IFn.invoke fallback. Before the fix, late-cleanup warned and reported
+    ;; :undevirtualized-remaining 1 here.
+    (let [v-ctor? @#'pipeline/value-ctor-factory-call?
+          out (java.io.StringWriter.)
+          err (java.io.StringWriter.)
+          result (binding [*out* out *err* err]
+                   (pipeline/explain-pipeline #'uw-vec2-factory-probe))]
+      (is (true? (v-ctor? '(raster.linalg.core/->Vec2 1.0 2.0))))
+      (is (false? (v-ctor? '(raster.numeric/sqrt 4.0))))
+      (is (= 0 (get-in result [:late-cleaned-stats :undevirtualized-remaining]))
+          "late-cleanup reports no surviving undevirtualized calls")
+      (is (not (re-find #"undevirtualized" (str err)))
+          "no undevirtualized WARNING is printed for a value-ctor factory call"))))

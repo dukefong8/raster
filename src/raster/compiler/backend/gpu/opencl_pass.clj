@@ -13,6 +13,7 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.core.types :as types]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -144,36 +145,10 @@
      form)
     (apply dissoc @found (keys (or declared {})))))
 
-(defn derive-param-types
-  "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags
-  (the typed-dispatch system already knows these — we read them instead of letting the emitter
-  guess from parameter names). Scalar params retain their resolved declared width, including
-  Float and Double independently of the selected tensor dtype. Physical narrowing belongs to a scheduled
-  ABI conversion with a range check, not source type derivation.
-  Array params: the tag's element dtype, with float-family (float/double)
-  mapped to a floating-point KERNEL dtype (a single-precision kernel reads float buffers regardless of a
-  parametric (All [T]) param's default).
-  Integral kernel policies retain declared floating types rather than turning scales into bytes.
-  With :preserve-declared-array-storage? true, resolved array tags instead retain their
-  physical element dtype; scalar computation precision is unchanged.
-  Returns {:scalar-types {sym kw} :array-types {sym kw}}, attached as form metadata that
-  opencl-pass reads. ONE derivation, both compile paths."
-  ([params tags dtype] (derive-param-types params tags dtype {}))
-  ([params tags dtype {:keys [preserve-declared-array-storage?]}]
-  (when (and params tags)
-    {:scalar-types (into {} (keep (fn [[p t]]
-                                    (case (dtype/dtype-for-scalar-tag t)
-                                      :long [p :long]
-                                      :int [p :int]
-                                      (:double :float) [p (dtype/dtype-for-scalar-tag t)]
-                                      nil))
-                                  (map vector params tags)))
-     :array-types (into {} (keep (fn [[p t]]
-                                   (when-let [dt (dtype/dtype-for-array-tag t)]
-                                     [p (if (and (not preserve-declared-array-storage?)
-                                                 (#{:float :double} dt) (dtype/fp-dtype? dtype))
-                                          dtype dt)]))
-                                 (map vector params tags)))})))
+(def derive-param-types
+  "Alias of the canonical raster.compiler.passes.parallel.device/derive-param-types.
+  Kept here so GPU-backend callers are unaffected by the move."
+  device/derive-param-types)
 
 (defn- segop-attempt
   "Run a SegOp lowering `thunk`, returning the SegOp or nil and recording a structured decline.
@@ -659,7 +634,7 @@
                              (get-in kernel [:attributes :kernel-body :schedule :strategy])
                              :scheduled-artifact)
                 artifact (register-kernel! (assoc-in kernel [:attributes :strategy] strategy)
-                                            stat-key)
+                                           stat-key)
                 dispatch (kdispatch/make
                           {:id (str "scheduled-artifact-"
                                     (Integer/toUnsignedString (hash artifact) 16))
@@ -1030,9 +1005,9 @@
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map-void! form))
                 (if-let [scheduled (take-bound-segop
-                                 stats :segmap
-                                 #(and (segop/seg-map? %)
-                                       (= :typed-soac (:algorithm-dialect %))))]
+                                    stats :segmap
+                                    #(and (segop/seg-map? %)
+                                          (= :typed-soac (:algorithm-dialect %))))]
                   (let [kernel (segop-cl/generate-scheduled-segmap-kernel
                                 scheduled
                                 :dtype (:dtype scheduled)
@@ -1117,7 +1092,7 @@
                   (emit-nested-map! form)
                   (let [array-types (assoc top-array-types index :int)
                         segmap (source->segmap stats (gensym "scatter_result_") form
-                                              dtype device-id top-scalar-types array-types)
+                                               dtype device-id top-scalar-types array-types)
                         kernel (segop-cl/generate-scheduled-segmap-kernel
                                 segmap :dtype dtype :scalar-types top-scalar-types
                                 :storage-context *bound-storage-context*
@@ -1137,7 +1112,7 @@
                   (emit-nested-map! form)
                   (let [array-types (assoc top-array-types index :int)
                         segmap (source->segmap stats (gensym "gather_result_") form
-                                              dtype device-id top-scalar-types array-types)
+                                               dtype device-id top-scalar-types array-types)
                         kernel (segop-cl/generate-scheduled-segmap-kernel
                                 segmap :dtype dtype :scalar-types top-scalar-types
                                 :storage-context *bound-storage-context*
@@ -1154,7 +1129,7 @@
                     (par/expand-par-reduce-by-key form))
                 (let [array-types (assoc top-array-types keys :int)
                       segmap (source->segmap stats (gensym "reduce_by_key_result_") form
-                                            dtype device-id top-scalar-types array-types)
+                                             dtype device-id top-scalar-types array-types)
                       kernel (segop-cl/generate-scheduled-segmap-kernel
                               segmap :dtype dtype :scalar-types top-scalar-types
                               :storage-context *bound-storage-context*

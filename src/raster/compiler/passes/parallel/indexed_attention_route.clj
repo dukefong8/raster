@@ -1,9 +1,31 @@
 (ns raster.compiler.passes.parallel.indexed-attention-route
   "Structured routing for recognized indexed graph-attention plans."
-  (:require [raster.compiler.backend.gpu.indexed-attention :as emit]
-            [raster.compiler.ir.segmented-weighted-reduction :as swr]
+  (:require [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.indexed-weighted-reduction-capability
              :as indexed-capability]))
+
+;; ================================================================
+;; Lazy indexed-attention GPU emitter resolution
+;; ================================================================
+;; This namespace is required from src only by the GPU OpenCL/SPIR-V routing seam
+;; (segmented-weighted-reduction-route's leaf registry), and by device tests; a JVM/bytecode
+;; deployment therefore never loads backend.gpu.indexed-attention. Each call site is inside a
+;; leaf that only emits after capability admission, so the resolve cannot fire on a decline.
+;; A missing emitter is a loud failure AT THE EMISSION SITE — never a silent scalar fallback.
+;;
+;; `@` is required: requiring-resolve returns a VAR, and invoking a Var applies its root value
+;; (the fn) — `@` derefs it. Without it the call receives arity 0.
+
+(def ^:private ia-emit-reference
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.indexed-attention/emit-reference)))
+(def ^:private ia-emit-dynamic-reference
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.indexed-attention/emit-dynamic-reference)))
+(def ^:private ia-emit-dynamic-score-reuse
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.indexed-attention/emit-dynamic-score-reuse)))
+(def ^:private ia-kernel-graph
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.indexed-attention/kernel-graph)))
+(def ^:private ia-dynamic-kernel-graph
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.indexed-attention/dynamic-kernel-graph)))
 
 (defn- decline
   ([plan reason data] (decline plan :indexed-edge-list-reference reason data))
@@ -38,14 +60,14 @@
                    :actual storage-dtypes})
 
          :else
-         (let [artifact (emit/emit-reference plan shape-env desc)]
+         (let [artifact (@ia-emit-reference plan shape-env desc)]
            {:operation plan
             :plan plan
             :strategy :indexed-segmented-reduction-reference
             :reference? true
             :declines []
             :artifact artifact
-            :graph (emit/kernel-graph plan shape-env artifact)
+            :graph (@ia-kernel-graph plan shape-env artifact)
             :schedule {:workgroup-size (:workgroup-size (:launch artifact))
                        :group-count (:group-count (:launch artifact))}})))
      (catch clojure.lang.ExceptionInfo e
@@ -87,12 +109,12 @@
                    :actual storage-dtypes})
 
          :else
-         (let [artifact (emit/emit-dynamic-reference plan desc)]
+         (let [artifact (@ia-emit-dynamic-reference plan desc)]
            {:operation plan :plan plan
             :strategy :indexed-segmented-reduction-reference
             :reference? true :dynamic-shape? true :declines []
             :artifact artifact
-            :graph (emit/dynamic-kernel-graph plan artifact)
+            :graph (@ia-dynamic-kernel-graph plan artifact)
             :schedule {:workgroup-size (:workgroup-size (:launch artifact))
                        :group-count (:group-count (:launch artifact))}})))
      (catch clojure.lang.ExceptionInfo e
@@ -120,13 +142,13 @@
            (decline plan leaf reason data)
            ;; The emitter still reads the compatibility key. Keep it pinned to the normalized
            ;; width that passed capability admission rather than independently defaulting to 16.
-           (let [artifact (emit/emit-dynamic-score-reuse
+           (let [artifact (@ia-emit-dynamic-score-reuse
                            plan (assoc desc :subgroup-size width))]
              {:operation plan :plan plan
               :strategy :indexed-segmented-reduction-subgroup-score-reuse
               :reference? false :dynamic-shape? true :declines []
               :artifact artifact
-              :graph (emit/dynamic-kernel-graph plan artifact)
+              :graph (@ia-dynamic-kernel-graph plan artifact)
               :schedule {:workgroup-size (:workgroup-size (:launch artifact))
                          :group-count (:group-count (:launch artifact))}})))
        (catch clojure.lang.ExceptionInfo e

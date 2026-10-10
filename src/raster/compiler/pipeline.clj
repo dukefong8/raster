@@ -37,19 +37,18 @@
             [raster.compiler.ir.abstract-value :as abstract-value]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
-            [raster.compiler.backend.wasm.emit :as wasm-emit]
             [raster.compiler.backend.intrinsics :as ix]
-            [raster.compiler.backend.gpu.wgsl :as wgsl-emit]
+            ;; NOTE: the GPU/WASM backends (backend.gpu.*, backend.wasm.*) are deliberately NOT
+            ;; required here. They are resolved lazily with requiring-resolve inside the branches
+            ;; that actually target them, so a JVM/bytecode-only deployment can load this ns (and
+            ;; the ~200-ns closure behind it) without the GPU emitters on the classpath. Every
+            ;; such site is already gated on device/select-runtime-backend returning :opencl or on
+            ;; an explicit compile-wasm/compile-wgsl/compile-gpu-program call.
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.resident-program-projection :as resident-projection]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-soac-frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-soac-route]
-            [raster.compiler.backend.gpu.entry :as gpu-entry]
-            [raster.compiler.backend.gpu.par-opencl :as par-opencl]
-            [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
-            [raster.compiler.backend.gpu.parallel-program-opencl :as parallel-program-opencl]
-            [raster.compiler.backend.gpu.parallel-program-c-family :as parallel-program-c-family]
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
@@ -341,8 +340,8 @@
                (fn [position [symbol initializer]]
                  (let [later (concat (map second (subvec pairs (inc position))) body)
                        unused? (not (contains? (apply set/union #{}
-                                                       (map util/free-syms later))
-                                                symbol))
+                                                      (map util/free-syms later))
+                                               symbol))
                        statement? (or (util/void-form? initializer)
                                       (and unused? (util/effect-loop-statement? initializer)))]
                    [(cond-> symbol
@@ -966,28 +965,35 @@
     ;; must abstain before promotion; the unchanged resident suffix owns the SoA program.
     (when (and (= :typed-soac (:dialect semantic))
                (set/subset? public-parameters representable))
-      (let [typed (structured-route/promote-program semantic opts)
-          scheduled (structured-route/schedule-program typed opts)
-          plans (parallel-program-c-family/product-consumer-plans scheduled)]
-      (when (seq plans)
-        (let [target-device (:target-device opts)
-              target-dialect (if (= :ocl (device/device-type target-device))
-                               :opencl-portable :opencl-intel)
-              emission (parallel-program-c-family/emit-program
-                        scheduled (assoc opts :target-dialect target-dialect))]
+      (let [;; GPU-resident C-family emission is an optional route reached only from
+          ;; compile-gpu-program; resolve it lazily so a JVM/bytecode deployment does
+          ;; not need backend.gpu.parallel-program-c-family on the classpath.
+            product-consumer-plans @(requiring-resolve
+                                     'raster.compiler.backend.gpu.parallel-program-c-family/product-consumer-plans)
+            c-family-emit-program @(requiring-resolve
+                                    'raster.compiler.backend.gpu.parallel-program-c-family/emit-program)
+            typed (structured-route/promote-program semantic opts)
+            scheduled (structured-route/schedule-program typed opts)
+            plans (product-consumer-plans scheduled)]
+        (when (seq plans)
+          (let [target-device (:target-device opts)
+                target-dialect (if (= :ocl (device/device-type target-device))
+                                 :opencl-portable :opencl-intel)
+                emission (c-family-emit-program
+                          scheduled (assoc opts :target-dialect target-dialect))]
           ;; The descriptor extractor's single `:result-sym` cannot yet represent a retained
           ;; multi-result functional boundary. Effect programs with explicit result storage—the
           ;; projection and quantizer use case—have no such ambiguity.
-          (when (empty? (get-in emission [:program :outputs]))
-            (let [projection (resident-projection/project (:program emission) target-device)]
-              (register-gpu-kernels! (:kernels projection) target-device)
-              (register-gpu-dispatches! (:dispatches projection) target-device)
-              (assoc projection
-                     :stats (:stats emission)
-                     :semantic semantic
-                     :scheduled scheduled
-                     :emitted-program (:program emission)
-                     :backend :opencl)))))))))
+            (when (empty? (get-in emission [:program :outputs]))
+              (let [projection (resident-projection/project (:program emission) target-device)]
+                (register-gpu-kernels! (:kernels projection) target-device)
+                (register-gpu-dispatches! (:dispatches projection) target-device)
+                (assoc projection
+                       :stats (:stats emission)
+                       :semantic semantic
+                       :scheduled scheduled
+                       :emitted-program (:program emission)
+                       :backend :opencl)))))))))
 
 (defn- pass-materialize
   "Materialize pure par/map forms into alloc + par/map! for backend consumption.
@@ -1061,7 +1067,8 @@
         (if (and (parallel-program/parallel-program? form)
                  (= :scheduled-parallel (:dialect form)))
           (let [{:keys [program kernels stats]}
-                (parallel-program-opencl/emit-program form opts)]
+                ((requiring-resolve 'raster.compiler.backend.gpu.parallel-program-opencl/emit-program)
+                 form opts)]
             ;; Emission is complete and source-independent here. Diagnostics retain that immutable
             ;; program and its artifacts so coverage describes the real equation-first vertical.
             ;; The ordinary compile-aot entry still cannot guess physical buffers, scalar values,
@@ -1081,7 +1088,7 @@
                        (vary-meta assoc :scalar-types (:scalar-types opts)
                                   :array-types (:array-types opts)
                                   :buffer-projections (:buffer-projections opts)))
-                result (apply opencl-pass/opencl-pass form
+                result (apply (requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass) form
                               (cond-> [:device-id target-device
                                        :dtype (:dtype opts)
                                        :preserve-declared-array-storage?
@@ -1505,7 +1512,7 @@
             ;; source ABI facts, not GPU-only emitter hints: the TypedSOAC frontend needs them on
             ;; JVM AOT as well so an integral array read cannot inherit the ambient floating dtype
             ;; before a checked source conversion is projected back to bytecode.
-            parameter-types (opencl-pass/derive-param-types
+            parameter-types (device/derive-param-types
                              (:raster.core/deftm-params (meta resolved-var))
                              (:raster.core/deftm-tags (meta resolved-var))
                              effective-dtype
@@ -1590,8 +1597,8 @@
   ([device-id dispatch-id arguments]
    (invoke-scheduled-executable! device-id dispatch-id arguments :single))
   ([device-id dispatch-id arguments result-policy]
-  ((requiring-resolve 'raster.gpu.core/invoke-staged-executable!)
-   device-id dispatch-id arguments result-policy)))
+   ((requiring-resolve 'raster.gpu.core/invoke-staged-executable!)
+    device-id dispatch-id arguments result-policy)))
 
 (def ^:private gpu-alloc-ops
   "Array-allocating ops that appear as devirtualized .invk (not a bare `float-array` head): a
@@ -1967,7 +1974,7 @@
    selects and binds that compiler value; it does not recognize GEMM shapes or reconstruct
    conversion/split kernels."
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?
-                            preserve-declared-array-storage?]
+                             preserve-declared-array-storage?]
                       :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
   (when (dispatch/host-only? f-var)
     (throw (ex-info "GPU compilation was requested for an explicitly host-only deftm"
@@ -2031,7 +2038,7 @@
         ;; TypedSOAC those facts before fusion instead of defaulting every resident array to the
         ;; program dtype. Value-type signatures are derived only after SoA expansion below.
         (when-not value-fn?
-          (opencl-pass/derive-param-types
+          (device/derive-param-types
            (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype
            {:preserve-declared-array-storage? preserve-declared-array-storage?}))
         pre-opts (cond-> {:inline? true :simd? false :target-device device-id
@@ -2048,7 +2055,7 @@
                           :array-types (:array-types pre-gpu-param-types)))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
         pre-diagnostic (when compiler-report?
-                          (run-passes-diagnostic raw-form gpu-resident-pre-soa-passes pre-opts))
+                         (run-passes-diagnostic raw-form gpu-resident-pre-soa-passes pre-opts))
         form-mat (if pre-diagnostic
                    (:form pre-diagnostic)
                    (run-passes raw-form gpu-resident-pre-soa-passes pre-opts))
@@ -2056,10 +2063,10 @@
         (if value-fn?
           (soa-lower/soa-lower form-mat param-specs)
           {:body form-mat :params param-specs :soa-expansion {}})
-        gpu-param-types (opencl-pass/derive-param-types
+        gpu-param-types (device/derive-param-types
                          (mapv :sym eff-param-specs) (mapv :tag eff-param-specs) effective-dtype
                          {:preserve-declared-array-storage? preserve-declared-array-storage?})
-        original-param-types (opencl-pass/derive-param-types
+        original-param-types (device/derive-param-types
                               (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype
                               {:preserve-declared-array-storage? preserve-declared-array-storage?})
         original-array-set (set (keys (:array-types original-param-types)))
@@ -2088,7 +2095,7 @@
                          :physical-layout {:kind :ordered-fields
                                            :field-order (mapv :field leaves)}
                          :leaves leaves}]))
-              soa-expansion))
+                   soa-expansion))
         post-opts (cond-> {:inline? true :simd? false :target-device device-id
                            :resident-gpu? true
                            :preserve-declared-array-storage? preserve-declared-array-storage?
@@ -2553,7 +2560,8 @@
         callees (vals (:by-key result))
         root*   (cond-> (assoc root :export? true)
                   (:root-ck result) (assoc :call-key (:root-ck result)))
-        module  (wasm-emit/compile-module (into [root*] callees))
+        module  ((requiring-resolve 'raster.compiler.backend.wasm.emit/compile-module)
+                 (into [root*] callees))
         entry   (first (:exports module))]
     {:bytes (:bytes module)
      :name (:name entry) :param-types (:param-types entry)
@@ -2572,7 +2580,8 @@
                          (wasm-kernel-spec (:var s) (or (:dtype s) :double) (:name s) (:wasm-simd? s))))
                      specs)
         sig-by-name (into {} (map (juxt :name :sig) kspecs))
-        module (wasm-emit/compile-module kspecs)]
+        module ((requiring-resolve 'raster.compiler.backend.wasm.emit/compile-module)
+                kspecs)]
     (update module :exports
             (fn [exs] (mapv #(assoc % :sig (sig-by-name (:name %))) exs)))))
 
@@ -2583,7 +2592,8 @@
    :n-sym :workgroup} — the host binds arrays as f32 storage buffers in order,
    then a uniform struct (scalars + _n). v1: elementwise maps."
   [f-var & {:keys [name]}]
-  (wgsl-emit/compile-kernel (wasm-kernel-spec f-var :float name false)))
+  ((requiring-resolve 'raster.compiler.backend.gpu.wgsl/compile-kernel)
+   (wasm-kernel-spec f-var :float name false)))
 
 ;; ================================================================
 ;; Typed gradient helpers (ftm-based, primitive fast-path)
@@ -2644,7 +2654,7 @@
         ;; Declared parameter types are middle-end facts, not GPU-emitter hints.  Production
         ;; compilation supplies them for every backend; diagnostics must do the same or a
         ;; target-free `show-pipeline` can misclassify proven identity casts as throwing.
-        parameter-types (opencl-pass/derive-param-types
+        parameter-types (device/derive-param-types
                          (:raster.core/deftm-params (meta resolved-var))
                          (:raster.core/deftm-tags (meta resolved-var))
                          effective-dtype

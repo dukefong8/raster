@@ -21,10 +21,13 @@
             [raster.compiler.core.util :as util]
             [clojure.string :as str]
             [clojure.walk :as walk]
-            [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.passes.parallel.contract-lower :as cl]
-            [raster.compiler.backend.gpu.segop-opencl :as sco]
-            [raster.compiler.backend.gpu.c-emit :as ce]
+            ;; The GPU emitters below (gemm / segop-opencl / c-emit) are resolved LAZILY. This
+            ;; namespace is reachable from the JVM/bytecode middle end (structured-control and
+            ;; typed-soac routes reuse its lowering helpers), and a JVM-only deployment must not
+            ;; have to ship backend.gpu.*. Every use-site below sits inside a leaf that is only
+            ;; selected when a GPU target descriptor is present, so the resolve cannot fire on
+            ;; the scalar/SIMD path.
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contraction-facts :as cf]
@@ -42,6 +45,58 @@
             [raster.compiler.passes.parallel.staged-contraction-schedule :as staged-schedule]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]))
+
+;; ================================================================
+;; Lazy GPU emitter resolution
+;; ================================================================
+;; Every GPU emitter this namespace calls is resolved through one of these delays, so
+;; backend.gpu.* is loaded on FIRST USE inside a GPU-gated leaf, not when this middle-end
+;; namespace is required. This namespace is reachable from the JVM/bytecode path (the
+;; structured-control and typed-soac routes reuse its lowering helpers), and a JVM-only
+;; deployment must not have to ship the GPU emitters.
+;;
+;; `@` is required: requiring-resolve returns a VAR, and invoking a Var applies its root
+;; value (the fn) — `@` derefs it. Without it the call receives arity 0.
+;;
+;; A missing emitter fails loud AT THE EMISSION SITE, which is the correct place for it — a
+;; silent scalar fallback would miscompile rather than report.
+
+(def ^:private sco-generate-contraction-kernel-body
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/generate-contraction-kernel-body)))
+(def ^:private sco-generate-dpas-kernel-body
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/generate-dpas-kernel-body)))
+(def ^:private sco-generate-register-tiled-kernel-body
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/generate-register-tiled-kernel-body)))
+(def ^:private sco-generate-segmented-reduce-kernel
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/generate-segmented-reduce-kernel)))
+(def ^:private sco-generate-segmap-nd-kernel
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/generate-segmap-nd-kernel)))
+(def ^:private sco-generate-segred-kernel
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/generate-segred-kernel)))
+(def ^:private sco-generate-staged-contraction-kernel
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/generate-staged-contraction-kernel)))
+
+(def ^:private gemm-mixed-dpas-schedule
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.gemm/mixed-dpas-schedule)))
+(def ^:private gemm-emit-batched-matrix-alternative
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-batched-matrix-alternative)))
+(def ^:private gemm-emit-matrix-alternatives
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-matrix-alternatives)))
+(def ^:private gemm-emit-matrix-direct-alternative
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-matrix-direct-alternative)))
+(def ^:private gemm-direct-tile-strategy
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.gemm/direct-tile-strategy)))
+(def ^:private gemm-emit-matrix-dynamic-lhs-alternative
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-matrix-dynamic-lhs-alternative)))
+(def ^:private gemm-dynamic-lhs-strategy
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.gemm/dynamic-lhs-strategy)))
+(def ^:private gemm-emit-matrix-input-fusion-alternative
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-matrix-input-fusion-alternative)))
+(def ^:private gemm-tile-input-strategy
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.gemm/tile-input-strategy)))
+
+(def ^:private ce-normalize-array-prims
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.c-emit/normalize-array-prims)))
 
 (defn par-contract-form?
   "Is `form` a (raster.par/contract out free-axes contract-axes body & opts) form?"
@@ -427,72 +482,72 @@
             {::declines [{:leaf :dpas :reason :mixed-operand-storage}
                          {:leaf :regtiled :reason :mixed-operand-storage}]}
             (route-2free-1contract out-sym dtype desc tile
-                                  epilogue contract-facts operation-id candidate-families
-                                  scalar-types)))]
+                                   epilogue contract-facts operation-id candidate-families
+                                   scalar-types)))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
     (require-declared-output-dtype!
      contract-facts
      (validate-descriptor
-     (epilogue-honoured-or-refused
-      epilogue
-      (cond
+      (epilogue-honoured-or-refused
+       epilogue
+       (cond
       ;; STAGED contract axis → the multi-level accumulate leaf. Checked FIRST because staging is
       ;; a property of the reduction itself, not of the dtype: it is what lets a block-quantized
       ;; format (int32 MAC inside the block, float accumulate across blocks) be expressed in the
       ;; contraction algebra at all. The flat leaves below cannot represent it — they have one
       ;; accumulator. 1 stage is the flat case and is left to them.
-        (and (seq stages) (> (count stages) 1))
-        (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
+         (and (seq stages) (> (count stages) 1))
+         (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
             ;; assumes `+`. A form carrying :combine max routed here and was SILENTLY SUMMED —
             ;; contraction-facts surfaces :combine and nothing read it. Refuse rather than ignore.
-              _ (let [cmb (:combine (cf/scalar-reduction-view contract-facts))]
-                  (when-not (contains? '#{+ clojure.core/+ raster.numeric/+} cmb)
-                    (throw (ex-info (str "staged contraction: only `+` combine is supported (got "
-                                         cmb ") — every accumulator level uses += and a lift's "
-                                         "linearity argument assumes addition")
-                                    {:reason :non-plus-combine-on-staged :combine cmb}))))
+               _ (let [cmb (:combine (cf/scalar-reduction-view contract-facts))]
+                   (when-not (contains? '#{+ clojure.core/+ raster.numeric/+} cmb)
+                     (throw (ex-info (str "staged contraction: only `+` combine is supported (got "
+                                          cmb ") — every accumulator level uses += and a lift's "
+                                          "linearity argument assumes addition")
+                                     {:reason :non-plus-combine-on-staged :combine cmb}))))
             ;; PEAK: with declared+verified operand maps, the inner stage tensorizes to dp4a (4 int8
             ;; MACs per int32 op) — the int8 peak leaf, and the same shape llama.cpp hand-writes.
             ;; Only attempted when the caller asked for peak AND the gate passes; a gate rejection
             ;; falls back to the scalar nest, so requesting peak can never yield a wrong kernel.
-              spec {:free-axes free-axes :stages stages
+               spec {:free-axes free-axes :stages stages
                   ;; the axes the FORM declared, read off FACTS — a single derivation whose only
                   ;; input is the form, so there is no separately-computed value to pass
                   ;; inconsistently (which is what made the span rule unfireable)
-                    :contract-axes (:contract-axes contract-facts)
-                    :body (:body contract-facts)
-                    :inputs (vec (sort-by name (contract-operand-arrays (:body contract-facts))))
-                    :operands operands
-                    :dtype dtype :out-dtype (or (:out-dtype contract-facts) :float)}
-              tz? (and prefer-peak? (seq operands)
-                       (:ok (staged-schedule/inner-dp4a-plan spec)))
-              k (sco/generate-staged-contraction-kernel
-                 (assoc spec :tensorize-inner? (boolean tz?)) out-sym)]
-          {:strategy :staged-segred
-           :kernel-name (:kernel-name k) :source (:source k)
-           :array-params (:array-params k)
-           :abi (:abi k)
+                     :contract-axes (:contract-axes contract-facts)
+                     :body (:body contract-facts)
+                     :inputs (vec (sort-by name (contract-operand-arrays (:body contract-facts))))
+                     :operands operands
+                     :dtype dtype :out-dtype (or (:out-dtype contract-facts) :float)}
+               tz? (and prefer-peak? (seq operands)
+                        (:ok (staged-schedule/inner-dp4a-plan spec)))
+               k (@sco-generate-staged-contraction-kernel
+                  (assoc spec :tensorize-inner? (boolean tz?)) out-sym)]
+           {:strategy :staged-segred
+            :kernel-name (:kernel-name k) :source (:source k)
+            :array-params (:array-params k)
+            :abi (:abi k)
          ;; the per-stage scale arrays are EXTRA pointer params — surfaced so a caller binds them
-           :lift-operands (:lift-operands k)
-           :dtype (:dtype k) :out-dtype (:out-dtype k)
-           :out-elems (:out-elems k)
-           :stages (:stages k)
+            :lift-operands (:lift-operands k)
+            :dtype (:dtype k) :out-dtype (:out-dtype k)
+            :out-elems (:out-elems k)
+            :stages (:stages k)
          ;; the operand BUFFERS are bound unchanged; only the kernel's view of them widens to int32
-           :tensorized (:tensorized k) :packed (:packed k)
-           :scalar-args (descriptor-scalar-arguments (:abi k) [nseg])
-           :wg [256 1]
-           :grid [(ceil-div nseg 256) 1]})
+            :tensorized (:tensorized k) :packed (:packed k)
+            :scalar-args (descriptor-scalar-arguments (:abi k) [nseg])
+            :wg [256 1]
+            :grid [(ceil-div nseg 256) 1]})
 
       ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
-        (#{:byte :int8} dtype)
-        (route-quant
+         (#{:byte :int8} dtype)
+         (route-quant
          ;; Quant leaves still rewrite surface layout for the optional transpose pre-step. Keep
          ;; that temporary projection local to the leaf instead of making syntax a common router
          ;; invariant; ordinary typed contraction families never observe it.
-         (compatibility-form! (or contract-form (cf/surface-form contract-facts)) :quant)
-         out-sym n-free n-contract nseg prefer-peak?)
+          (compatibility-form! (or contract-form (cf/surface-form contract-facts)) :quant)
+          out-sym n-free n-contract nseg prefer-peak?)
 
       ;; 0 FREE axes → a full reduction to a scalar. This is the last cell of contract's
       ;; algebra: (n free, 0 contract) = map, (n, n) = contraction, (0, n) = REDUCTION. The
@@ -501,32 +556,32 @@
       ;; Its launch protocol differs (one scheduled partial phase plus a host-side terminal
       ;; combine), so the descriptor says so with :invoke :reduction rather than pretending it is
       ;; a 2-D kernel launch.
-        (zero? n-free)
-        (let [semantic-operation
-              (or scheduled-operation
-                  (cl/contract-form->segred
-                   (compatibility-form! contract-form :full-reduce)
-                   :dtype dtype :facts contract-facts))
+         (zero? n-free)
+         (let [semantic-operation
+               (or scheduled-operation
+                   (cl/contract-form->segred
+                    (compatibility-form! contract-form :full-reduce)
+                    :dtype dtype :facts contract-facts))
               ;; The SegSpace is authoritative here. In particular, two or more contraction axes
               ;; have already been flattened to their checked row-major product; selecting the
               ;; first surface bound would schedule only a prefix of the reduction.
-              red-bound (:bound (segop/seg-space-reduced-dim (:space semantic-operation)))
-              sr (scalar-contraction-phase semantic-operation out-sym dtype red-bound)
-              k (sco/generate-segred-kernel
-                 sr out-sym :dtype dtype :coordinate-proof contract-facts)
-              attrs (:attributes k)]
-          {:strategy :full-reduce
-           :invoke :reduction
-           :artifact k
-           :kernel-name (:kernel-name k) :source (:source k)
-           :array-params (:array-params attrs)
-           :abi (:abi k) :arguments (:arguments k)
-           :dtype dtype :out-dtype dtype :out-elems 1
+               red-bound (:bound (segop/seg-space-reduced-dim (:space semantic-operation)))
+               sr (scalar-contraction-phase semantic-operation out-sym dtype red-bound)
+               k (@sco-generate-segred-kernel
+                  sr out-sym :dtype dtype :coordinate-proof contract-facts)
+               attrs (:attributes k)]
+           {:strategy :full-reduce
+            :invoke :reduction
+            :artifact k
+            :kernel-name (:kernel-name k) :source (:source k)
+            :array-params (:array-params attrs)
+            :abi (:abi k) :arguments (:arguments k)
+            :dtype dtype :out-dtype dtype :out-elems 1
          ;; CARRY THE COMBINE for descriptor inspection as well as in the artifact attributes.
          ;; The staging runtime reads the artifact attributes for its host-side final combine.
-           :c-op (:c-op attrs) :identity-val (:identity-val attrs)
-           :reduce-bound red-bound          ; element count the reduction spans
-           :scalar-args [] :dims [1]})
+            :c-op (:c-op attrs) :identity-val (:identity-val attrs)
+            :reduce-bound red-bound          ; element count the reduction spans
+            :scalar-args [] :dims [1]})
 
         (zero? n-contract)
         (let [sm (cl/contraction-facts->segmap contract-facts)
@@ -534,10 +589,10 @@
                         contract-facts sm desc
                         {:array-types (or array-types {}) :scalar-types (or scalar-types {})})
               emitted (when (:ok portable)
-                        (sco/generate-contraction-kernel-body (:body portable)))
+                        (@sco-generate-contraction-kernel-body (:body portable)))
               {:keys [kernel-name source array-params scalar-params abi]}
               (or emitted
-                  (sco/generate-segmap-nd-kernel
+                  (@sco-generate-segmap-nd-kernel
                    (cl/contract-form->segmap
                     (compatibility-form! (or contract-form (cf/surface-form contract-facts)) :segmap)
                     :dtype dtype)
@@ -565,80 +620,80 @@
       ;; A `{::declines …}` result means BOTH tensorize leaves refused for a documented reason —
       ;; we fall through to the general naive leaf rather than hard-failing a perfectly legal
       ;; contraction, and carry the reasons onto that leaf's descriptor.
-        (and (= 2 n-free) (= 1 n-contract) (:strategy (tensorize-plan)))
-        (tensorize-plan)
+         (and (= 2 n-free) (= 1 n-contract) (:strategy (tensorize-plan)))
+         (tensorize-plan)
 
       ;; everything else (n-free≠2, n≥2 contract axes, or a tensorize-ineligible 2-free form)
       ;; → the portable scheduled KernelBody when its operand layouts are provable. During the
       ;; migration, unsupported gathers retain the verified source emitter as an explicit decline.
-        :else
-        (do
-          (when-not (contains? candidate-families :portable)
-            (throw (ex-info "no enabled contraction schedule family can lower this equation"
-                            {:reason :no-legal-contraction-family
-                             :operation operation-id
-                             :families candidate-families
-                             :declines (when (and (= 2 n-free) (= 1 n-contract))
-                                         (::declines (tensorize-plan)))})))
-          (let [sr (or scheduled-operation
-                       (cl/contract-form->segred
-                        (compatibility-form! contract-form :portable-segred)
-                        :dtype dtype :facts contract-facts))
-                portable (contraction-schedule/plan-portable-body
-                          contract-facts sr desc
-                          {:array-types (or array-types {}) :scalar-types (or scalar-types {})})
-                _ (when (and (not (:ok portable))
-                             (or mixed-core-storage?
-                                 (some #(contains? #{:float :double}
-                                                   (some-> (get scalar-types %) dtype/canon))
-                                       (:scalars sr))))
-                    (throw (ex-info
-                            "mixed storage or floating captures require a typed portable contraction schedule"
-                            {:reason :no-legal-contraction-family
-                             :operation operation-id :families candidate-families
-                             :declines [{:leaf :portable-kernel-body
-                                         :reason (:reason portable) :data (:detail portable)}]
-                             :fallback :none})))
-                emitted (when (:ok portable)
-                          (sco/generate-contraction-kernel-body (:body portable)))
-                {:keys [kernel-name source array-params scalar-params abi
-                        epilogue-operands epilogue-scalars]}
-                (or emitted (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype))
+         :else
+         (do
+           (when-not (contains? candidate-families :portable)
+             (throw (ex-info "no enabled contraction schedule family can lower this equation"
+                             {:reason :no-legal-contraction-family
+                              :operation operation-id
+                              :families candidate-families
+                              :declines (when (and (= 2 n-free) (= 1 n-contract))
+                                          (::declines (tensorize-plan)))})))
+           (let [sr (or scheduled-operation
+                        (cl/contract-form->segred
+                         (compatibility-form! contract-form :portable-segred)
+                         :dtype dtype :facts contract-facts))
+                 portable (contraction-schedule/plan-portable-body
+                           contract-facts sr desc
+                           {:array-types (or array-types {}) :scalar-types (or scalar-types {})})
+                 _ (when (and (not (:ok portable))
+                              (or mixed-core-storage?
+                                  (some #(contains? #{:float :double}
+                                                    (some-> (get scalar-types %) dtype/canon))
+                                        (:scalars sr))))
+                     (throw (ex-info
+                             "mixed storage or floating captures require a typed portable contraction schedule"
+                             {:reason :no-legal-contraction-family
+                              :operation operation-id :families candidate-families
+                              :declines [{:leaf :portable-kernel-body
+                                          :reason (:reason portable) :data (:detail portable)}]
+                              :fallback :none})))
+                 emitted (when (:ok portable)
+                           (@sco-generate-contraction-kernel-body (:body portable)))
+                 {:keys [kernel-name source array-params scalar-params abi
+                         epilogue-operands epilogue-scalars]}
+                 (or emitted (@sco-generate-segmented-reduce-kernel sr out-sym :dtype dtype))
             ;; WHY THIS LEAF AND NOT A FASTER ONE. Only meaningful for the 2-free/1-contract shape,
             ;; where a tensorize leaf was actually attempted; for every other shape no faster leaf
             ;; exists to decline, so an empty vector is the honest answer rather than a fabricated
             ;; "not eligible".
-                declines (when (and (= 2 n-free) (= 1 n-contract))
-                           (::declines (tensorize-plan)))
-                declines (cond-> (vec declines)
-                           (not (:ok portable))
-                           (conj {:leaf :portable-kernel-body
-                                  :reason (:reason portable)
-                                  :data (:detail portable)}))
-                workgroup-size (or (:workgroup-size portable) 256)]
-            (cond->
-             {:strategy (if (:ok portable) :portable-segred :naive-segred)
-              :emission-route (if emitted (:emission-route emitted) :verified-segmented-opencl)
-              :declines declines
-              :kernel-name kernel-name :source source :array-params array-params :abi abi
-              :epilogue-operands epilogue-operands
-              :epilogue-scalars epilogue-scalars
-              :fused-epilogue (boolean epilogue)
-              :kernel-body (:body portable)
-              :dtype dtype
-              :out-dtype (or (some (fn [slot]
-                                     (when (= :result (:role slot)) (:dtype slot)))
-                                   abi)
-                             dtype)
+                 declines (when (and (= 2 n-free) (= 1 n-contract))
+                            (::declines (tensorize-plan)))
+                 declines (cond-> (vec declines)
+                            (not (:ok portable))
+                            (conj {:leaf :portable-kernel-body
+                                   :reason (:reason portable)
+                                   :data (:detail portable)}))
+                 workgroup-size (or (:workgroup-size portable) 256)]
+             (cond->
+              {:strategy (if (:ok portable) :portable-segred :naive-segred)
+               :emission-route (if emitted (:emission-route emitted) :verified-segmented-opencl)
+               :declines declines
+               :kernel-name kernel-name :source source :array-params array-params :abi abi
+               :epilogue-operands epilogue-operands
+               :epilogue-scalars epilogue-scalars
+               :fused-epilogue (boolean epilogue)
+               :kernel-body (:body portable)
+               :dtype dtype
+               :out-dtype (or (some (fn [slot]
+                                      (when (= :result (:role slot)) (:dtype slot)))
+                                    abi)
+                              dtype)
          ;; Values follow the emitter's scalar order; widths come only from its typed ABI.
-              :scalar-args (descriptor-scalar-arguments abi (conj (vec scalar-params) nseg))
-              :out-elems nseg :dims [nseg]
-              :wg [workgroup-size]
-              :grid [(ceil-div nseg workgroup-size)]}
+               :scalar-args (descriptor-scalar-arguments abi (conj (vec scalar-params) nseg))
+               :out-elems nseg :dims [nseg]
+               :wg [workgroup-size]
+               :grid [(ceil-div nseg workgroup-size)]}
           ;; the LAST decline is the decisive one — the leaf that would otherwise have taken the
           ;; work. Using the first reported DPAS's generic :not-a-contraction where regtiled's
           ;; specific :symbolic-dims / :non-plus-combine is the actual answer.
-              (seq declines) (assoc :fallback-reason (:reason (last declines))))))))))))
+               (seq declines) (assoc :fallback-reason (:reason (last declines))))))))))))
 
 (defn- families-for-precision
   "Restrict candidate families to the compile's precision policy.
@@ -677,7 +732,6 @@
                        :allowed contraction-families})))
     families))
 
-
 (defn route-typed-contraction
   "Route one scheduled scalar TypedSOAC contraction from its algorithm and exact SegRed.
 
@@ -709,12 +763,12 @@
                                        :dtype dtype
                                        :facts facts
                                        :array-types (into {} (map (fn [id]
-                                                                  [id (get-in (soac-dialect/facts program)
-                                                                              [:values id :dtype])]))
+                                                                    [id (get-in (soac-dialect/facts program)
+                                                                                [:values id :dtype])]))
                                                           (:inputs operation))
                                        :scalar-types (into {} (map (fn [id]
-                                                                   [id (get-in (soac-dialect/facts program)
-                                                                               [:values id :dtype])]))
+                                                                     [id (get-in (soac-dialect/facts program)
+                                                                                 [:values id :dtype])]))
                                                            (:scalars operation))
                                        :scheduled-operation operation
                                        :candidate-families families
@@ -1228,8 +1282,8 @@
         matrix-view (when (and matrix-enabled? (= :float (dtype/canon dtype)))
                       (cf/dense-matrix-view facts))
         scalar-types (into {} (keep (fn [[slot argument]]
-                                     (when (= :scalar (:kind slot))
-                                       [argument (:dtype slot)])))
+                                      (when (= :scalar (:kind slot))
+                                        [argument (:dtype slot)])))
                            (map vector abi arguments))
         ;; Uniform Long shapes retain wide layout/combine extents; matrix coordinates and
         ;; grid-Z counts use checked specialization plus ABI-derived admission guards.
@@ -1239,7 +1293,7 @@
                                    (cond-> (vec (:dimensions matrix-view))
                                      (:batched? matrix-view) (conj (:batch matrix-view)))))
         target-schedule (when (and (= :mixed-f16-f32 precision) (:ok matrix-view))
-                          (gpu-gemm/mixed-dpas-schedule (:desc options) (:tile options)))
+                          (@gemm-mixed-dpas-schedule (:desc options) (:tile options)))
         matrix-tiles (get options :matrix-tiles :default)
         expanded-matrix-tiles? (or (= :finite matrix-tiles) (vector? matrix-tiles))
         tile-schedules
@@ -1251,7 +1305,7 @@
                             (vector? matrix-tiles) matrix-tiles
                             :else [])
                 tiles (distinct (cons (:tile target-schedule) requested))]
-            (mapv #(gpu-gemm/mixed-dpas-schedule (:desc options) %) tiles)))]
+            (mapv #(@gemm-mixed-dpas-schedule (:desc options) %) tiles)))]
     (cond
       (not matrix-enabled?)
       {:alternatives [] :decline {:reason :schedule-family-disabled :family :matrix}}
@@ -1295,35 +1349,35 @@
             semantic-effects (:effects source-graph)
             emit-spec (merge
                        {:id [:typed-contraction operation-id]
-                       :a row :b col :c (:out facts)
-                       :m m :n n :k k
+                        :a row :b col :c (:out facts)
+                        :m m :n n :k k
                        ;; Matrix scheduling drops an optional leading batch axis, but the
                        ;; remaining coordinate identities continue to scope the typed result
                        ;; transform.  Preserve that proven semantic→scheduled correspondence.
-                       :axis-symbols
-                       (vec (concat (map first (take-last 2 (:free-axes facts)))
-                                    (map first (:contract-axes facts))))
-                       :variant (:variant matrix-view)
-                       :epilogue (:epilogue matrix-view)
-                       :precision :mixed-f16-f32
-                       :tile (:tile target-schedule)
-                       :fill-workgroups (:fill-workgroups target-schedule)
-                       :source-operation operation
-                       :source-graph source-graph
-                       :external-interface {:abi abi :arguments arguments
-                                            :effects semantic-effects}
-                       :split-factors (or (:split-factors options) [])}
+                        :axis-symbols
+                        (vec (concat (map first (take-last 2 (:free-axes facts)))
+                                     (map first (:contract-axes facts))))
+                        :variant (:variant matrix-view)
+                        :epilogue (:epilogue matrix-view)
+                        :precision :mixed-f16-f32
+                        :tile (:tile target-schedule)
+                        :fill-workgroups (:fill-workgroups target-schedule)
+                        :source-operation operation
+                        :source-graph source-graph
+                        :external-interface {:abi abi :arguments arguments
+                                             :effects semantic-effects}
+                        :split-factors (or (:split-factors options) [])}
                        ;; These are schedule policy, not GEMM semantics.  Keep them on the
                        ;; compiler-owned requested-splits expression so a resolved public
                        ;; schedule can change occupancy policy without teaching the binder or
                        ;; target emitter about contractions.
                        (select-keys options [:target-fill-multiple :min-split-chunk :max-splits]))
             emitted (if (:batched? matrix-view)
-                      (gpu-gemm/emit-batched-matrix-alternative
+                      (@gemm-emit-batched-matrix-alternative
                        (assoc emit-spec
                               :batch (:batch matrix-view)
                               :batching (:batching matrix-view)))
-                      (gpu-gemm/emit-matrix-alternatives emit-spec))
+                      (@gemm-emit-matrix-alternatives emit-spec))
             raw-alternatives (if (:batched? matrix-view)
                                [(:graph emitted)]
                                (:alternatives emitted))
@@ -1340,12 +1394,12 @@
                      scheduled (assoc emit-spec
                                       :tile tile
                                       :fill-workgroups (:fill-workgroups schedule))]
-                 [(gpu-gemm/emit-matrix-direct-alternative
-                   (assoc scheduled :strategy (gpu-gemm/direct-tile-strategy tile)))
-                  (gpu-gemm/emit-matrix-dynamic-lhs-alternative
-                   (assoc scheduled :strategy (gpu-gemm/dynamic-lhs-strategy tile)))
-                  (gpu-gemm/emit-matrix-input-fusion-alternative
-                   (assoc scheduled :strategy (gpu-gemm/tile-input-strategy tile)))]))
+                 [(@gemm-emit-matrix-direct-alternative
+                   (assoc scheduled :strategy (@gemm-direct-tile-strategy tile)))
+                  (@gemm-emit-matrix-dynamic-lhs-alternative
+                   (assoc scheduled :strategy (@gemm-dynamic-lhs-strategy tile)))
+                  (@gemm-emit-matrix-input-fusion-alternative
+                   (assoc scheduled :strategy (@gemm-tile-input-strategy tile)))]))
              additional-tile-schedules)
             raw-alternatives (into raw-alternatives additional-tile-alternatives)
             alternatives (mapv (fn [graph]
@@ -1391,9 +1445,9 @@
                            :xmx-direct-dynamic-lhs target-schedule
                            :xmx-direct-tile-inputs target-schedule}
                           (mapcat (fn [schedule]
-                                    [[(gpu-gemm/direct-tile-strategy (:tile schedule)) schedule]
-                                     [(gpu-gemm/dynamic-lhs-strategy (:tile schedule)) schedule]
-                                     [(gpu-gemm/tile-input-strategy (:tile schedule)) schedule]]))
+                                    [[(@gemm-direct-tile-strategy (:tile schedule)) schedule]
+                                     [(@gemm-dynamic-lhs-strategy (:tile schedule)) schedule]
+                                     [(@gemm-tile-input-strategy (:tile schedule)) schedule]]))
                           additional-tile-schedules))))}))))
 
 (defn- replace-selector-strategy
@@ -1430,7 +1484,7 @@
                                                    "register-tiled condition has no fallback inverse"
                                                    {:reason :raster/bug
                                                     :condition condition})))
-                                   :strategy :portable-segred))
+                         :strategy :portable-segred))
                 (register-tiled-body/admission-preconditions [m n k] tile))]
       (case (:kind selector)
         :fixed-strategy
@@ -1642,7 +1696,7 @@
 
                    (and (:ok scheduled)
                         (= :dpas (get-in scheduled [:tile :matrix :family])))
-                   (sco/generate-dpas-kernel-body (:body scheduled) out-sym)
+                   (@sco-generate-dpas-kernel-body (:body scheduled) out-sym)
 
                    (:ok scheduled)
                    {:tensorized false :reason :matrix-target-not-routed
@@ -1677,7 +1731,7 @@
                    (or (nil? (:out-dtype contract-facts))
                        (= (dtype/canon (:out-dtype contract-facts))
                           (dtype/canon dtype))))
-            (let [rt (sco/generate-register-tiled-kernel-body
+            (let [rt (@sco-generate-register-tiled-kernel-body
                       contract-facts out-sym :operation-id operation-id :descriptor desc
                       :scalar-types scalar-types)
                   [bm bn _bk] (:block rt)
@@ -1749,7 +1803,7 @@
                (= 2 (count (od/call-args body))))
       (let [[i-sym M] (first free-axes) [j-sym N] (second free-axes) [l-sym K] (first contract-axes)
             ext {i-sym M j-sym N l-sym K}
-            agets (mapv ce/normalize-array-prims (od/call-args body))
+            agets (mapv @ce-normalize-array-prims (od/call-args body))
             agets (filterv od/aget-call? agets)]
         (when (= 2 (count agets))
           (let [syms-of (fn [g] (set (filter symbol? (tree-seq coll? seq (od/aget-index g)))))
@@ -1848,7 +1902,7 @@
                                               (:dp4a cf/leaf-layouts)))
                         (:ok (staged-schedule/inner-dp4a-plan (spec form true)))))
         emit (fn [form tz? pre-steps]
-               (let [k (sco/generate-staged-contraction-kernel (spec form tz?) out-sym)]
+               (let [k (@sco-generate-staged-contraction-kernel (spec form tz?) out-sym)]
                  (cond-> {:strategy (if tz? :dp4a :quant-naive)
                           :kernel-name (:kernel-name k) :source (:source k)
                           :array-params (:array-params k)

@@ -4,13 +4,19 @@
    This namespace chooses no schedule and emits no kernel.  It is shared by compatibility routing
    and equation-first certificate construction so both boundaries retain one ordered set of
    hardware, dtype, and storage legality checks."
-  (:require [raster.compiler.backend.gpu.target :as gpu-target]
-            [raster.compiler.core.hardware :as hardware]
+  ;; NOTE: backend.gpu.target holds only source-DIALECT selection predicates and has no
+  ;; dependencies, but it is reached from the shared middle end through
+  ;; indexed-weighted-reduction-body. It is resolved lazily (see `score-reuse`) so the capability
+  ;; check does not drag a GPU backend namespace into a JVM/bytecode deployment.
+  (:require [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]))
 
 (defn- declined
   [reason data]
   {:status :declined :reason reason :data data})
+
+(def ^:private intel-opencl-subgroup-dialect?*
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.target/intel-opencl-subgroup-dialect?)))
 
 (defn score-reuse
   "Check whether `descriptor` can execute the existing subgroup score-reuse body.
@@ -26,7 +32,12 @@
         max-workgroup-size (hardware/maximum-workgroup-size descriptor)
         supported-widths (hardware/supported-subgroup-sizes descriptor)
         matrix-family (get-in descriptor [:matrix :family])
-        intel-dialect? (gpu-target/intel-opencl-subgroup-dialect? descriptor)]
+        intel-dialect? (if (nil? descriptor)
+                         ;; No target descriptor is a decline, not a dialect question. Answer it
+                         ;; WITHOUT resolving backend.gpu.target: this admission runs on the
+                         ;; shared middle-end path and must not require a GPU backend namespace.
+                         false
+                         (@intel-opencl-subgroup-dialect?* descriptor))]
     (cond
       (and descriptor (not= :gpu (:device-type descriptor)))
       (declined :score-reuse-requires-gpu

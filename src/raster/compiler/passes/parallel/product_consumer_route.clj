@@ -3,14 +3,29 @@
 
    The semantic source remains the exact two-node graph.  The refined graph has one compound
    schedule node whose private workgroup allocation replaces the source graph temporary."
-  (:require [raster.compiler.backend.gpu.kernel-body-target :as target]
-            [raster.compiler.ir.kernel-executable :as executable]
+  (:require [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.passes.parallel.product-consumer-body :as body]
             [raster.compiler.passes.parallel.product-consumer-schedule :as schedule]))
+
+(def ^:private emit-artifact*
+  (delay (requiring-resolve 'raster.compiler.backend.gpu.kernel-body-target/emit-artifact)))
+
+(defn- target-emit-artifact
+  "Resolve `emit-artifact` in raster.compiler.backend.gpu.kernel-body-target on first use.
+
+  This is the ONLY GPU dependency of the product-consumer route and it fires at emission time,
+  after `schedule` has already produced the certified ScheduledKernelBody. Keeping the resolve
+  here (instead of a static require) is what lets a JVM/bytecode deployment load this namespace
+  without backend.gpu.*; a missing emitter is a loud failure at the emission site, never a
+  silent scheduling fallback."
+  ([kernel-name scheduled target-dialect]
+   (@emit-artifact* kernel-name scheduled target-dialect))
+  ([kernel-name scheduled target-dialect opts]
+   (@emit-artifact* kernel-name scheduled target-dialect opts)))
 
 (defn- compound-source [plan]
   {:kind :product-ordered-consumer
@@ -19,15 +34,15 @@
 
 (defn- numerical-contract [plan options]
   (cond-> {:mode :reassociated
-   :policy :declared-integral-tree-with-ordered-outer-fold
-   :accumulators
-   (mapv (fn [ordinal dtype]
-           {:value [:inner-product ordinal]
-            :dtype dtype :rounding :exact
-            :overflow (get-in plan [:numerics :inner :overflow])
-            :policy :declared-product-tree})
-         (range) (get-in plan [:numerics :inner :dtypes]))
-   :ordered-consumer (get-in plan [:numerics :outer])}
+           :policy :declared-integral-tree-with-ordered-outer-fold
+           :accumulators
+           (mapv (fn [ordinal dtype]
+                   {:value [:inner-product ordinal]
+                    :dtype dtype :rounding :exact
+                    :overflow (get-in plan [:numerics :inner :overflow])
+                    :policy :declared-product-tree})
+                 (range) (get-in plan [:numerics :inner :dtypes]))
+           :ordered-consumer (get-in plan [:numerics :outer])}
     (contains? options :scalar-math)
     (assoc :scalar-math (numerics/validate-scalar-math-policy! (:scalar-math options)))))
 
@@ -89,10 +104,10 @@
 
 (defn emit
   "Project a scheduled product-consumer region to one executable C-family graph."
-  ([kernel-name routed target-dialect]
+([kernel-name routed target-dialect]
    (emit kernel-name routed target-dialect {}))
   ([kernel-name {:keys [scheduled graph refinement] :as routed} target-dialect caller-options]
-  (let [artifact (target/emit-artifact kernel-name scheduled target-dialect
+  (let [artifact (target-emit-artifact kernel-name scheduled target-dialect
                                      (select-keys caller-options [:target-descriptor :scalar-math]))
         public-interface (graph/public-interface (:abi artifact) (:arguments artifact))
         pairs (mapv vector (:abi public-interface) (:arguments public-interface))

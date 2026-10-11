@@ -477,6 +477,16 @@
                         :form-head head :sym sym}))
                (done tenv []))
 
+             ;; Known scan/reduce/map handlers above own their scoped rules.
+             ;; Other parallel captures must not disappear in argument-only
+             ;; ordinary-call activity. Inactive effects still execute primal.
+             (and (= :par (:kind (form/form-info init)))
+                  ;; Reverse-template existence alone is not a forward rule.
+                  ;; Explicit/structure-derived JVP rules reach fold-call below.
+                  (not (tmpl/op-jvp-fn (:operation (opdesc/call-description init)))))
+             (do (rev/assert-unhandled-parallel-region! init (any-active? tenv init) sym)
+                 (done tenv []))
+
              ;; call (incl. devirtualized .invk)
              :else
              (let [{op-sym :operation args :arguments lexical :lexical-callee}

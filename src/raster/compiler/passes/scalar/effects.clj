@@ -169,23 +169,31 @@
           (and source target
                (= [:exact :exact] (scalar-conversion/policy source target)))))))
 
-(defn- checked-integral-cast?
-  "Whether a semantic expression contains a source cast which may throw.
+(defn- source-cast-flags
+  "Evaluation obligations for source casts derived from the shared descriptor.
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
-   checked casts to integral types remain conservatively non-removable. A proven
-   identity/widening or a successful checked constant conversion adds no obligation."
+   checked integral casts remain conservatively non-removable. Local product
+   lowering additionally retains its generic factory's reference conversion
+   obligation explicitly. Untyped scoped binders require their own type evidence;
+   this does not globally reinterpret their casts as reference conversions."
   [expr]
-  (boolean
-   (some (fn [node]
+  (into #{}
+   (mapcat (fn [node]
            (when (seq? node)
              (let [operation (descriptor/semantic-op node)]
-               (and (descriptor/cast-op? operation)
-                    (= :reject (descriptor/cast-integral-narrowing operation))
-                    (contains? '#{byte int long}
-                               (descriptor/cast-result-tag operation))
-                    (not (proven-total-cast? node))))))
+               (when (descriptor/cast-op? operation)
+                    (cond-> []
+                        (and (not (proven-total-cast? node))
+                             (= :reject (descriptor/cast-integral-narrowing operation))
+                             (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
+                        (conj :checked-source-cast)
+                        ;; This is denial-only evidence from the source factory:
+                        ;; no optimizer may erase its conversion merely because
+                        ;; the projected field is not otherwise used.
+                        (true? (:raster.effect/source-reference-cast (meta node)))
+                        (conj :source-reference-cast))))))
          (tree-seq coll? seq expr))))
 
 (def ^:private descriptor-cache-capacity 65536)
@@ -274,9 +282,7 @@
           result (if (map? result)
                    (update result :flags #(or % #{}))
                    {:effect (or result :io) :flags #{}})]
-      (cond-> result
-        (checked-integral-cast? semantic-expr)
-        (update :flags conj :checked-source-cast)))
+      (update result :flags into (source-cast-flags semantic-expr)))
     (catch Exception _
       ;; Conservative: unknown = effectful
       {:effect :io :flags #{}})

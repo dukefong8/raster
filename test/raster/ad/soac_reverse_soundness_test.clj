@@ -3,6 +3,7 @@
   active initializer, and transposes every admitted read; reads it cannot
   transpose are rejected instead of silently mis-scattered."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.core :refer [deftm scan]]
             [raster.ad.reverse :as rev]
             [raster.ad.jvp :as jvp]
@@ -156,18 +157,186 @@
                    out))]
     (ra/aget result 1)))
 
+(deftm inactive-stored-shadow-cast-loop [h :- Double] :- Double
+  (let [double (fn [v] (clojure.core/double (float v)))
+        out (double-array 2)
+        result (loop [i 0 acc 0.5]
+                 (if (< i 2)
+                   (let [next (* acc acc)]
+                     (ra/aset out i (double next))
+                     (recur (inc i) next))
+                   out))]
+    (+ h (ra/aget result 1))))
+
+(deftm excluded-stored-shadow-cast-loop [h :- Double x :- Double] :- Double
+  (let [double (fn [v] (clojure.core/double (float v)))
+        out (double-array 2)
+        result (loop [i 0 acc x]
+                 (if (< i 2)
+                   (let [next (if (zero? i) acc
+                                  (let [z (- acc 16777216.0)] (* z z)))]
+                     (ra/aset out i (double next))
+                     (recur (inc i) next))
+                   out))]
+    (+ h (ra/aget result 1))))
+
+(deftm inactive-loop-before-two-active-loops [h :- Double] :- Double
+  (let [double (fn [v] (clojure.core/double (float v)))
+        out (double-array 2)
+        initial (loop [i 0 acc 0.5]
+                  (if (< i 2)
+                    (let [next (* acc acc)]
+                      (ra/aset out i (double next))
+                      (recur (inc i) next))
+                    out))
+        first-active (loop [i 0 acc h]
+                       (if (< i 2)
+                         (recur (inc i) (+ acc 1.0))
+                         (+ acc 0.0)))
+        second-active (loop [i 0 acc first-active]
+                        (if (< i 2)
+                          (recur (inc i) (+ acc 1.0))
+                          (+ acc 0.0)))]
+    (+ second-active (ra/aget initial 1))))
+
+(deftm unsupported-carry-dependent-bound [x :- Double] :- Double
+  (loop [i 0 acc x]
+    (if (< i (long acc))
+      (recur (inc i) (+ acc x))
+      acc)))
+
+(deftest generic-loop-route-does-not-admit-carry-dependent-bounds
+  ;; Construction only: x >= 1 would not terminate. Zero-trip examples do
+  ;; not establish a derivative/tape contract for this data-dependent loop.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"par/scan.*fixed-point"
+                       (rev/value+grad #'unsupported-carry-dependent-bound))))
+
+(deftest inactive-stored-checkpoints-remain-primal-only
+  (is (= [2.0625 1.0] ((rev/value+grad #'inactive-stored-shadow-cast-loop) 2.0)))
+  (is (= [2.0625 1.0] ((jvp/jvp #'inactive-stored-shadow-cast-loop) 2.0 1.0)))
+  (is (= 2.25 (excluded-stored-shadow-cast-loop 2.0 16777216.5)))
+  (is (= [2.25 1.0 nil]
+         ((rev/value+grad #'excluded-stored-shadow-cast-loop :wrt [0])
+          2.0 16777216.5)))
+  (is (= 5.0625 (inactive-loop-before-two-active-loops 1.0)))
+  (is (= [5.0625 1.0]
+         ((rev/value+grad #'inactive-loop-before-two-active-loops) 1.0))))
+
+(defn- checkpoint-denials [body]
+  (filter #(contains? (meta %) :raster.ad.reverse/inexact-source-scan-checkpoint)
+          (tree-seq coll? seq body)))
+
+(deftest checkpoint-denial-is-monotone-not-capability-evidence
+  (let [retain @(ns-resolve 'raster.ad.reverse 'retain-source-scan-checkpoint-obligations)
+        enforce @(ns-resolve 'raster.ad.reverse 'assert-source-scan-checkpoint!)
+        source (first (raster.core/ensure-walked-body! #'shadowed-cast-stored-loop))
+        exact-source (first (raster.core/ensure-walked-body! #'explicit-cast-stored-loop))
+        key :raster.ad.reverse/inexact-source-scan-checkpoint
+        mark-loops (fn [body payload]
+                     (walk/postwalk
+                      #(if (and (seq? %) (#{'loop 'loop*} (first %)))
+                         (vary-meta % assoc key payload) %)
+                      body))]
+    (rev/call-with-shared-ad-gensym
+     (fn []
+       (let [once (rev/ad-prepare source {'h0 'double})
+             twice (rev/ad-prepare once {'h0 'double})]
+         (is (empty? (checkpoint-denials source)))
+         (is (seq (checkpoint-denials once)))
+         (is (seq (checkpoint-denials twice)))
+         (doseq [body [once twice] expression (checkpoint-denials body)]
+           (is (true? (get (meta expression) key)))
+           (is (= :ad-scan-carry-precision
+                  (try (enforce expression true) nil
+                       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+           (is (nil? (enforce expression false))))
+         (is (empty? (checkpoint-denials
+                      (rev/ad-prepare (rev/ad-prepare exact-source {'h0 'double})
+                                      {'h0 'double})))))))
+    (doseq [[v env] [[#'inactive-stored-shadow-cast-loop {'h 'double}]
+                     [#'excluded-stored-shadow-cast-loop {'h 'double 'x 'double}]]]
+      (rev/call-with-shared-ad-gensym
+       (fn []
+         (let [once (rev/ad-prepare (first (raster.core/ensure-walked-body! v)) env)
+               twice (rev/ad-prepare once env)]
+           (is (seq (checkpoint-denials once)))
+           (is (seq (checkpoint-denials twice)))
+           (doseq [expression (checkpoint-denials twice)]
+             (is (nil? (enforce expression false))))))))
+    ;; Neither a fabricated safe claim nor stale/malformed evidence can grant
+    ;; capability. On exact source, a forged denial is conservatively a denial.
+    (doseq [payload [true false nil {:safe? true} {:source 'stale}]]
+      (doseq [body [source exact-source]]
+        (let [retained (retain (mark-loops body payload))
+              denials (checkpoint-denials retained)]
+          (is (seq denials))
+          (doseq [expression denials]
+            (is (true? (get (meta expression) key)))
+            (is (= :ad-scan-carry-precision
+                   (try (enforce expression true) nil
+                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+            (is (nil? (enforce expression false)))))))))
+
+;; Real public composition seam: the value+grad function publishes a retained
+;; transformed body, which outer AD must prepare again. The holder's root is
+;; restored by with-redefs; no compiler registry or cache is reset.
+(def checkpoint-derived-value+grad nil)
+
+(deftm composed-checkpoint-primal [h :- Double x :- Double] :- Double
+  (double (first (checkpoint-derived-value+grad h x))))
+
+(deftest public-derived-body-composition-retains-checkpoint-denial
+  (with-redefs [checkpoint-derived-value+grad
+                (rev/value+grad #'excluded-stored-shadow-cast-loop :wrt [0])]
+    (is (= [2.25 1.0 nil] (checkpoint-derived-value+grad 2.0 16777216.5)))
+    (is (= 2.25 (composed-checkpoint-primal 2.0 16777216.5)))
+    (is (= :ad-scan-carry-precision
+           (try (rev/value+grad #'composed-checkpoint-primal :wrt [1]) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :ad-scan-carry-precision
+           (try (jvp/jvp #'composed-checkpoint-primal) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
 (deftest stored-loop-casts-retain-source-identity-through-scan-lifting
-  (let [x 16777216.5 h 0.0625
-        [v gradient] ((rev/value+grad #'explicit-cast-stored-loop) x)
-        [jv tangent] ((jvp/jvp #'explicit-cast-stored-loop) x 1.0)]
-    (is (= 0.25 (explicit-cast-stored-loop x) (shadowed-cast-stored-loop x) v jv))
-    (is (= 1.0 gradient tangent))
-    (is (= 1.0 (/ (- (shadowed-cast-stored-loop (+ x h))
-                     (shadowed-cast-stored-loop (- x h))) (* 2.0 h))))
-    (doseq [[construct reason] [[rev/value+grad :par-scan-carry-precision]
-                               [jvp/jvp :jvp-scan-carry-precision]]]
-      (is (= reason (try (construct #'shadowed-cast-stored-loop) nil
-                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+  (let [anchor 16777216.0 h 0.0625
+        ;; Plain Clojure oracle: round only the stored value, not feedback.
+        checkpoints (fn [x]
+                      (loop [i 0 carry x stored []]
+                        (if (< i 2)
+                          (let [next (if (zero? i) carry
+                                       (let [z (- carry anchor)] (* z z)))]
+                            (recur (inc i) next (conj stored (double (float next)))))
+                          stored)))
+        reverse (rev/value+grad #'explicit-cast-stored-loop)
+        forward (jvp/jvp #'explicit-cast-stored-loop)]
+    (doseq [[offset expected derivative] [[0.25 0.0625 0.5]
+                                         [0.5 0.25 1.0]
+                                         [0.75 0.5625 1.5]]]
+      (let [x (+ anchor offset)
+            [stored-first stored-last] (checkpoints x)
+            [v gradient] (reverse x)
+            [jv tangent] (forward x 1.0)]
+        (is (= anchor stored-first))
+        (is (not= x stored-first) "stored checkpoint cannot reconstruct the carry")
+        (is (= expected stored-last (shadowed-cast-stored-loop x)
+               (explicit-cast-stored-loop x) v jv))
+        (is (= derivative gradient tangent))
+        (is (= derivative (/ (- (shadowed-cast-stored-loop (+ x h))
+                                 (shadowed-cast-stored-loop (- x h))) (* 2.0 h))))
+        (is (= derivative (/ (- (last (checkpoints (+ x h)))
+                                 (last (checkpoints (- x h)))) (* 2.0 h))))))
+    ;; A separate unrounded tape is not implemented. The source obligation
+    ;; must survive beta and be enforced when this loop is actually active.
+    (let [prepared (rev/call-with-shared-ad-gensym
+                    #(rev/ad-prepare
+                      (first (raster.core/ensure-walked-body! #'shadowed-cast-stored-loop))
+                      {'h0 'double}))]
+      (is (some #(:raster.ad.reverse/inexact-source-scan-checkpoint (meta %))
+                (tree-seq coll? seq prepared))))
+    (doseq [construct [rev/value+grad jvp/jvp]]
+      (is (= :ad-scan-carry-precision
+             (try (construct #'shadowed-cast-stored-loop) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
 
 (deftm nonlinear-loop-with-shadowed-double [h0 :- Double] :- Double
   (let [double (fn [x] (clojure.core/double (float x)))]

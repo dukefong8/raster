@@ -8,6 +8,8 @@
   (:require [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.layout :as layout]
+            [raster.compiler.ir.extent-expression :as extent]
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-abi :as abi]
@@ -112,6 +114,32 @@
   ([kernel-body arguments] (derive-scalar-bindings kernel-body arguments nil))
   ([kernel-body arguments scalar-types]
    (scalar-bindings-from-checked-body (body/validate! kernel-body) arguments scalar-types)))
+
+(defn storage-expression-references
+  "Scalar leaves of retained pointer contracts. An exact backing extent names storage,
+   not a scalar ABI value."
+  [parameters]
+  (reduce into #{}
+          (for [parameter parameters
+                :when (not= :scalar (:kind parameter))
+                expression (concat (:shape parameter) (get-in parameter [:layout :strides])
+                                   (when (contains? parameter :minimum-elements)
+                                     [(:minimum-elements parameter)]))
+                :when (nil? (launch/backing-extent-id expression))]
+            (launch/expression-references expression))))
+
+(defn storage-scalar-closure
+  "Close retained storage contracts before constructing ABI parameters. Newly captured leaves
+   require explicit integral types from the source owner; they never inherit a guessed int."
+  [parameters scalar-types bound-ids]
+  (into {}
+        (for [reference (remove bound-ids (storage-expression-references parameters))]
+          (let [declared (some-> (get scalar-types reference) dtype/canon)]
+            (when-not (contains? #{:int :long} declared)
+              (fail! :scheduled-kernel-body-storage-scalar-dtype
+                     "retained storage requires an explicitly typed integral scalar"
+                     {:scalar reference :dtype declared}))
+            [reference declared]))))
 
 (defn- validate-scalar-bindings!
   [kernel-body arguments scalar-bindings]
@@ -314,6 +342,53 @@
                     :realization realization})))
           (target-library-expressions (:body scheduled)))))
 
+(defn graph-scalar-dependencies
+  "Operation dependencies plus represented storage leaves independently owned by the graph.
+   Shared by source certification and emitted ABI certification; a declared scalar alone never
+   authorizes an extra slot. Exact shape/layout correspondence is checked by the source owner."
+  [scheduled node kernel-graph]
+  (let [scheduled (validate! scheduled)
+        storage (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                              (:temporaries kernel-graph)))
+        substitutions (into {} (map (fn [[parameter argument]] [(:id parameter) argument]))
+                            (map vector (get-in scheduled [:body :parameters]) (:arguments scheduled)))
+        represented-storage-scalars
+        (reduce into #{} (map #(launch/expression-references
+                                (launch/rebind-expression % substitutions))
+                             (storage-expression-references (get-in scheduled [:body :parameters]))))
+        graph-storage-scalars
+        (reduce into #{}
+                (for [[parameter argument] (map vector (get-in scheduled [:body :parameters])
+                                                     (:arguments scheduled))
+                      :when (not= :scalar (:kind parameter))
+                      :let [elements (:elements (get storage argument))]
+                      :when (and elements (nil? (launch/backing-extent-id elements)))]
+                  (do
+                    ;; Output geometry can differ from graph allocation capacity in other
+                    ;; schedules. Only a newly captured output storage dependency requires
+                    ;; this exact storage proof; existing operation/launch scalars keep their
+                    ;; family-owned output admission unchanged.
+                    (when (and (= :output (:kind parameter))
+                               (seq (remove (set (:scalar-uses node))
+                                            (mapcat #(launch/expression-references
+                                                      (launch/rebind-expression % substitutions))
+                                                    (storage-expression-references [parameter])))))
+                      (let [shape (:shape parameter)
+                            candidate-elements (apply launch/product
+                                                      (map #(launch/rebind-expression % substitutions)
+                                                           shape))]
+                        (when-not (and (= (:dtype parameter) (:dtype (get storage argument)))
+                                       (= (layout/row-major shape (:dtype parameter)) (:layout parameter))
+                                       (extent/equivalent? candidate-elements elements))
+                          (fail! :scheduled-kernel-body-output-storage
+                                 "output-only storage scalars require exact graph-owned shape and layout"
+                                 {:parameter (:id parameter) :argument argument
+                                  :shape shape :graph-elements elements}))))
+                    (launch/expression-references elements))))]
+    (into (set (:scalar-uses node))
+          (filter graph-storage-scalars represented-storage-scalars))))
+
 (defn validate-against-node!
   "Require this refinement to implement one exact node in its complete KernelGraph context."
   [scheduled node kernel-graph]
@@ -331,7 +406,7 @@
         scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
         scalar-arguments (mapv :value (:scalar-bindings scheduled))
         actual-scalars (reduce into #{} (map launch/expression-references scalar-arguments))
-        expected-scalars (set (:scalar-uses node))]
+        expected-scalars (graph-scalar-dependencies scheduled node kernel-graph)]
     (when (nil? (:scalar-uses node))
       (fail! :scheduled-kernel-body-node-scalars
              "scheduled-body certification requires explicit graph-node scalar dependencies"
@@ -373,6 +448,40 @@
       (fail! :scheduled-kernel-body-node-membership
              "scheduled body requires an exact node from its graph"
              {:node (:id node)}))
+    scheduled))
+
+(defn validate-dense-input-storage!
+  "Independently compare flat dense read-capable pointers with graph-owned storage extents.
+   This checks correspondence, not the safety of arbitrary indexed reads."
+  [scheduled node kernel-graph]
+  (let [scheduled (validate-against-node! scheduled node kernel-graph)
+        buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph) (:temporaries kernel-graph)))
+        parameters (get-in scheduled [:body :parameters])
+        bindings (into {} (map (fn [[parameter argument]] [(:id parameter) argument]))
+                       (map vector parameters (:arguments scheduled)))
+        rebind #(if-let [backing (launch/backing-extent-id %)]
+                  (launch/runtime-value (list 'extent (get bindings backing backing)))
+                  (launch/rebind-expression % bindings))]
+    (doseq [[parameter argument] (map vector parameters (:arguments scheduled))
+            :when (contains? #{:input :inout} (:kind parameter))]
+      (let [elements (:elements (get buffers argument))
+            shape (mapv rebind (:shape parameter))
+            storage-layout (:layout parameter)
+            rebound-layout (cond-> (update storage-layout :shape #(mapv rebind %))
+                             (:strides storage-layout) (update :strides #(mapv rebind %)))]
+        (when-not (and (some? elements) (not= elements argument)
+                       (= 1 (count shape))
+                       (if-let [backing (launch/backing-extent-id (first shape))]
+                         (and (= backing argument)
+                              (= argument (launch/backing-extent-id elements)))
+                         (and (nil? (launch/backing-extent-id elements))
+                              (extent/equivalent? elements (first shape))))
+                       (= (layout/row-major shape (:dtype parameter)) rebound-layout))
+          (fail! :scheduled-kernel-body-input-storage
+                 "input pointer capacity differs from its dense graph storage"
+                 {:node (:id node) :parameter (:id parameter) :argument argument
+                  :expected [elements] :actual shape :layout rebound-layout}))))
     scheduled))
 
 (defn validate-artifact-projection!
@@ -461,3 +570,25 @@
                {:required-gfx-arch :gfx90a :required-alignment 16
                 :target-facts target-facts})))
     emitted))
+
+(defn certified-physical-scalar-dependencies
+  "Project one source node's physical scalar dependencies through its exact emitted certificate.
+   Additional storage dependencies require source-node certification before projection. Nodes
+   without a ScheduledKernelBody retain their original strict operation dependency contract."
+  [source-node source-graph emitted-artifact]
+  (let [certificate (get-in emitted-artifact [:provenance :scheduled-operation])]
+    (if-not (scheduled-kernel-body? certificate)
+      (:scalar-uses source-node)
+      (do
+        (validate-artifact-projection! certificate emitted-artifact)
+        (if (nil? (:scalars source-graph))
+          ;; Legacy graphs have no source scalar interface. Preserve only their original
+          ;; dependency contract; artifact validation cannot authorize new storage leaves.
+          (:scalar-uses source-node)
+          (do
+            (when (nil? (:scalar-uses source-node))
+              (fail! :scheduled-kernel-body-node-scalars
+                     "typed source graphs require an explicit node scalar dependency contract"
+                     {:node (:id source-node)}))
+            (validate-against-node! certificate source-node source-graph)
+            (graph-scalar-dependencies certificate source-node source-graph)))))))

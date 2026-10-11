@@ -20,7 +20,8 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
-            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
+            [raster.compiler.passes.parallel.map-read-requirements :as map-reads]))
 
 (defn- decline!
   [rule message data]
@@ -29,6 +30,19 @@
 
 (defn declined? [exception]
   (= :segfoldmap-kernel-body-declined (:reason (ex-data exception))))
+
+(defn- checked-input-shapes
+  [operation {:keys [array-shapes] :as options}]
+  (let [minima (when (some #(not (get array-shapes %)) (:inputs operation))
+                 (map-reads/segfoldmap-read-requirements operation options))]
+    (into {}
+          (map (fn [input]
+                 [input (or (get array-shapes input)
+                            (when-let [minimum (get minima input)]
+                              [(if (= 0 minimum) (launch/product 0) minimum)])
+                            ;; Bind the exact unknown backing range, not the iteration extent.
+                            [(launch/runtime-value (list 'extent input))])]))
+          (:inputs operation))))
 
 (defn- product-expression [values]
   (case (count values)
@@ -69,8 +83,8 @@
 
 (defn- lower-ordered
   "Apply the portable one-work-item-per-segment schedule to a SegFoldMap."
-  [segfold {:keys [workgroup-size array-types scalar-types scalar-math]
-            :or {array-types {} scalar-types {}}}]
+  [segfold {:keys [workgroup-size array-types scalar-types array-shapes scalar-math]
+            :or {array-types {} scalar-types {}} :as options}]
   (when-not (segop/seg-fold-map? segfold)
     (throw (ex-info "fold-map KernelBody lowering requires SegFoldMap"
                     {:reason :raster/bug :operation segfold})))
@@ -207,19 +221,27 @@
                                   (body/expression :mod quotient (lower-index bound)))))
          (range) segment-dims)
         base-coordinate (body/expression :mul segment-index map-extent)
-        parameters
+        input-shapes (checked-input-shapes segfold options)
+        pointer-parameters
         (vec (concat
               (map (fn [input]
-                     (let [input-dtype (get array-types input)]
-                       (body/->KernelParameter input :input input-dtype [total-elements] :global
-                                               (layout/row-major [total-elements] input-dtype)
+                     (let [input-dtype (get array-types input)
+                           shape (get input-shapes input)]
+                       (body/->KernelParameter input :input input-dtype shape :global
+                                               (layout/row-major shape input-dtype)
                                                :operand)))
                    inputs)
               (map (fn [output output-dtype]
                      (body/->KernelParameter output :output output-dtype [total-elements] :global
                                              (layout/row-major [total-elements] output-dtype)
                                              :result))
-                   outputs output-dtypes)
+                   outputs output-dtypes)))
+        storage-types (scheduled-body/storage-scalar-closure
+                       pointer-parameters (merge declared-scalar-types scalar-types) #{'_nseg})
+        scalars (vec (sort-by name (into (set scalars) (keys storage-types))))
+        scalar-types (merge scalar-types storage-types)
+        parameters
+        (vec (concat pointer-parameters
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_nseg :scalar :long [] nil nil :bound)]))
@@ -373,8 +395,8 @@
    partials through a portable shared-memory tree. After all folds complete, lanes traverse the
    dense final map cooperatively. This is a schedule for the general SegFoldMap algebra; no
    normalization, quantization format, or tensor-library operation is recognized here."
-  [segfold {:keys [workgroup-size array-types scalar-types scalar-math]
-            :or {array-types {} scalar-types {}}}]
+  [segfold {:keys [workgroup-size array-types scalar-types array-shapes scalar-math]
+            :or {array-types {} scalar-types {}} :as options}]
   (when-not (segop/seg-fold-map? segfold)
     (throw (ex-info "cooperative fold-map lowering requires SegFoldMap"
                     {:reason :raster/bug :operation segfold})))
@@ -453,6 +475,7 @@
                                                       (get array-types (symbol (name id)))
                                                       default-dtype))]))
                           (concat inputs outputs))
+        declared-scalar-types scalar-types
         scalar-types (into {}
                            (map (fn [id]
                                   [id (dtype/canon
@@ -496,19 +519,27 @@
                                   (body/expression :mod quotient (lower-index bound)))))
          (range) segment-dims)
         base-coordinate (body/expression :mul segment-index map-extent)
-        parameters
+        input-shapes (checked-input-shapes segfold options)
+        pointer-parameters
         (vec (concat
               (map (fn [input]
-                     (let [input-dtype (get array-types input)]
-                       (body/->KernelParameter input :input input-dtype [total-elements] :global
-                                               (layout/row-major [total-elements] input-dtype)
+                     (let [input-dtype (get array-types input)
+                           shape (get input-shapes input)]
+                       (body/->KernelParameter input :input input-dtype shape :global
+                                               (layout/row-major shape input-dtype)
                                                :operand)))
                    inputs)
               (map (fn [output output-dtype]
                      (body/->KernelParameter output :output output-dtype [total-elements] :global
                                              (layout/row-major [total-elements] output-dtype)
                                              :result))
-                   outputs output-dtypes)
+                   outputs output-dtypes)))
+        storage-types (scheduled-body/storage-scalar-closure
+                       pointer-parameters (merge declared-scalar-types scalar-types) #{})
+        scalars (vec (sort-by name (into (set scalars) (keys storage-types))))
+        scalar-types (merge scalar-types storage-types)
+        parameters
+        (vec (concat pointer-parameters
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)))
         base-env (merge (zipmap (map :name segment-dims) (repeat :long)) scalar-types)
@@ -771,14 +802,15 @@
   "Close a fold-map refinement over its exact source grid and graph storage descriptions.
 
    ScheduledKernelBody proves source/effect/scalar closure generically. Fold-map additionally knows
-   that every pointer is a dense `[segments, extent]` value and that the source KernelGrid is the
+   that results are dense `[segments, extent]` values, inputs retain graph-owned capacity,
+   and the source KernelGrid is the
    complete launch schedule, so this validator can derive—not trust—those remaining obligations."
   ([scheduled node kernel-graph]
    (validate-against-node! scheduled node kernel-graph nil nil))
   ([scheduled node kernel-graph closed-algorithm closed-body]
    (validate-against-node! scheduled node kernel-graph closed-algorithm closed-body {}))
   ([scheduled node kernel-graph closed-algorithm closed-body options]
-   (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
+   (let [scheduled (scheduled-body/validate-dense-input-storage! scheduled node kernel-graph)
          source (:source scheduled)
          _ (when-not (segop/seg-fold-map? source)
              (throw (ex-info "fold-map storage closure requires an exact SegFoldMap source"
@@ -798,7 +830,7 @@
                              (list '* (segop/seg-space-num-segments-expr (:space source))
                                    (:extent source))))]
      (doseq [[parameter argument] (map vector parameters (:arguments scheduled))
-             :when (not= :scalar (:kind parameter))]
+             :when (= :output (:kind parameter))]
        (let [buffer (get buffers argument)
              parameter-elements
              (extent-expression/operation
@@ -823,7 +855,14 @@
      (let [array-types (into {} (map (juxt :id :dtype)) (vals buffers))
            scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
            expected (schedule source (merge (select-keys options [:scalar-math])
-                                             {:array-types array-types :scalar-types scalar-types}))]
+                                             {:array-types array-types :scalar-types scalar-types
+                                              ;; The independent graph correspondence proof above
+                                              ;; admits equivalent storage spellings, not algorithm drift.
+                                              :array-shapes (into {}
+                                                                  (keep (fn [parameter]
+                                                                          (when (contains? #{:input :inout} (:kind parameter))
+                                                                            [(:id parameter) (:shape parameter)])))
+                                                                  parameters)}))]
        (when-not (= expected scheduled)
          (throw (ex-info "fold-map scheduled body differs from its exact source KernelGrid refinement"
                          {:reason :segfoldmap-schedule-source

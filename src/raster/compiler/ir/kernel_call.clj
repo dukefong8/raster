@@ -19,6 +19,9 @@
 (def ^:private body-launch-validator
   (delay (requiring-resolve 'raster.compiler.ir.kernel-body/validate-launch-index-ranges!)))
 
+(def ^:private body-capacity-contracts
+  (delay (requiring-resolve 'raster.compiler.ir.kernel-body-abi/retained-buffer-contracts)))
+
 (defn- validate-body-launch! [artifact geometry]
   (when-let [kernel-body (get-in artifact [:attributes :kernel-body])]
     (@body-launch-validator kernel-body geometry))
@@ -352,6 +355,86 @@
      :group-count (:group-count geometry)
      :shared-memory-bytes (:shared-memory-bytes geometry)}))
 
+(defn validate-retained-input-capacities!
+  "Preflight known read-capable storage against the exact retained KernelBody projection.
+   Opaque native handles remain caller-owned obligations; nil capacity never means zero.
+   Existing scalar algebra resolves shapes, including body parameter names whose compiler
+   argument spelling differs. Capacity is in ABI storage elements, never kernel view elements.
+   Independent minimum-elements obligations also cover output-only pointers; other output
+   capacities remain governed by the existing realized binding-plan rules."
+  [artifact arguments capacity-of]
+  (when (kart/kernel-artifact? artifact)
+    (let [artifact (kart/validate! artifact)
+          arguments (kabi/validate-arguments! (:abi artifact) arguments)]
+      (when-let [body (get-in artifact [:attributes :kernel-body])]
+        (let [parameters (@body-capacity-contracts (:abi artifact) body)
+            scalars (into {} (keep (fn [[parameter value]]
+                                    (when (= :scalar (:kind parameter))
+                                      [(:id parameter) (runtime-number value)])))
+                          (map vector parameters arguments))
+            resolve-argument (argument-resolver artifact arguments)
+            resolve-scalar #(if (contains? scalars %) (get scalars %) (resolve-argument %))
+            ;; A complete shape expression may itself be the physical scalar argument, e.g.
+            ;; a block scan receives ceil-div(n,wg), not n. Use that admitted binding before
+            ;; recursively asking for leaves that are deliberately absent from this ABI.
+            bound-expressions (into #{} (keep (fn [[slot argument]]
+                                              (when (= :scalar (:kind slot)) argument)))
+                                    (map vector (:abi artifact) (:arguments artifact)))
+            resolve-storage #(klaunch/resolve-expression
+                              resolve-scalar
+                              (if (and (not (integer? %)) (contains? bound-expressions %))
+                                (klaunch/runtime-value %) %))]
+        (doseq [[slot parameter value] (map vector (:abi artifact) parameters arguments)
+                :when (or (contains? #{:input :inout} (:kind slot))
+                          (contains? parameter :minimum-elements))
+                :let [backings (keep klaunch/backing-extent-id (:shape parameter))
+                      self-backed? (seq backings)
+                      _ (when (and self-backed?
+                                   (not (and (= 1 (count (:shape parameter)))
+                                             (= [(:id parameter)] (vec backings))
+                                             (nil? (get-in parameter [:layout :strides])))))
+                          (throw (ex-info "retained backing extent must name its exact flat input"
+                                          {:reason :kernel-body-capacity-backing :slot slot
+                                           :parameter (:id parameter) :shape (:shape parameter)})))
+                      capacity (capacity-of value slot)
+                      ;; Nil native capacity is an existing caller obligation, not zero and
+                      ;; not a read-minimum certificate. Only the exact self-backed case may
+                      ;; remain unresolved; every independently declared minimum still resolves.
+                      shape (when (contains? #{:input :inout} (:kind slot))
+                              (if self-backed?
+                                (when (some? capacity) [(long capacity)])
+                                (mapv resolve-storage (:shape parameter))))
+                      _ (when (some neg? shape)
+                          (throw (ex-info "retained storage extent must be non-negative"
+                                          {:reason :kernel-body-capacity-extent :slot slot :shape shape})))
+                      strides (some->> (get-in parameter [:layout :strides])
+                                       (mapv resolve-storage))
+                      _ (when (some neg? strides)
+                          (throw (ex-info "retained storage strides must be non-negative"
+                                          {:reason :kernel-body-capacity-layout :slot slot :strides strides})))
+                      storage-required (cond
+                                 (nil? shape) nil
+                                 (some zero? shape) 0
+                                 strides (reduce (fn [span [extent stride]]
+                                                   (Math/addExact
+                                                    (long span)
+                                                    (Math/multiplyExact (long (dec extent)) (long stride))))
+                                                 1 (map vector shape strides))
+                                 :else (reduce #(Math/multiplyExact (long %1) (long %2)) 1 shape))
+                      minimum (when (contains? parameter :minimum-elements)
+                                (resolve-storage (:minimum-elements parameter)))
+                      _ (when (and (some? minimum) (neg? minimum))
+                          (throw (ex-info "minimum elements must be non-negative"
+                                          {:reason :kernel-body-minimum-elements :slot slot
+                                           :minimum-elements minimum})))
+                      required (when (or (some? storage-required) (some? minimum))
+                                 (max (or storage-required 0) (or minimum 0)))]
+                :when (and (some? capacity) (some? required) (< (long capacity) required))]
+          (throw (ex-info "kernel buffer is smaller than its retained storage extent"
+                          {:reason :kernel-body-buffer-capacity :kernel-name (:kernel-name artifact)
+                           :slot slot :required-elements required :buffer-elements capacity})))))))
+  artifact)
+
 (defn validate-resident-output-capacities!
   "Check artifact-declared result extents before a backend contacts its driver.
 
@@ -360,6 +443,22 @@
    capacity facts; the artifact/launch rule is shared across backends."
   [call plan registered capacity-of]
   (let [{:keys [kernel-name pointer-pairs group-count]} plan
+        ;; One admission may require both a retained minimum and a realized output extent.
+        ;; Lazy, request-local facts preserve the original validation/callback order and are
+        ;; discarded here; they neither establish ownership nor survive a later use check.
+        capacities (reduce (fn [facts [slot value]]
+                             (if (some #(and (= slot (first %))
+                                             (identical? value (second %))) facts)
+                               facts
+                               (conj facts [slot value (delay (capacity-of value slot))])))
+                           [] (concat pointer-pairs
+                                      (filter #(not= :scalar (:kind (first %)))
+                                              (map vector (:abi registered) (:arguments plan)))))
+        capacity-of (fn [value slot]
+                      (force (some (fn [[fact-slot fact-value fact]]
+                                     (when (and (= slot fact-slot) (identical? value fact-value)) fact))
+                                   capacities)))
+        _ (validate-retained-input-capacities! registered (:arguments plan) capacity-of)
         results (filterv (fn [[slot _]] (= :result (:role slot))) pointer-pairs)
         kind (get-in registered [:effects :kind])]
     (when (contains? #{:pure-reduction :scalar-reduction-phase} kind)
@@ -371,7 +470,7 @@
           (throw (ex-info "resident reduction result buffer is smaller than its scheduled group count"
                           {:kernel-name kernel-name :slot slot
                            :required-elements required :buffer-elements capacity})))))
-    (when (= :tensor-contraction kind)
+    (when (contains? #{:pure-contraction :tensor-contraction} kind)
       (let [extent-expr (kart/attribute registered :out-elems)
             out-elems (long (if (number? extent-expr)
                               extent-expr

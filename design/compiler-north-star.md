@@ -1218,8 +1218,15 @@ Pointer conversion, access validation, alias admission, staging and cleanup have
 one dependency-light owner in `raster.runtime.native-call`; compiler adapters
 retain library lookup, descriptors, scalar ABI and arity validation. Numerical
 library adapters must share this owner rather than depend on compiler code or
-invent another staging implementation. Their existing critical downcalls still
-need migration; this ownership extraction does not make BLAS/LAPACK safe.
+invent another staging implementation. BLAS numerical handles now use ordinary
+downcalls and explicit per-pointer roles; all six batch entry points share one
+staging scope around both optional strided and per-head fallback paths. Packed
+native operands retain their caller-owned lifetime. LAPACK numerical handles
+also use that owner: Fortran reference arguments and LAPACKE's interleaved scalar
+ABI retain explicit access roles. Workspace queries and nonzero INFO statuses
+publish native output before wrapper interpretation; a numerical status is not
+a thrown downcall. This does not establish arbitrary native-helper safety or
+performance equivalence to critical heap pinning.
 
 General AOT functions use ordinary FFM downcalls, not critical calls inferred from syntax or
 input size. Heap arrays use invocation-owned staging; copyback follows the same
@@ -1239,6 +1246,20 @@ back. A critical call is a separate, explicit caller guarantee of extremely
 short bounded execution in all cases with no upcalls, never the general default.
 Benchmarks must distinguish ordinary resident, staged, and explicitly critical
 boundaries; a tiny critical probe does not establish workload speed or safety.
+
+Numerical ABIs may interleave scalar and pointer arguments. Runtime preparation
+derives pointer positions from resolved FFM handle carriers, snapshots explicit
+access declarations and retains original ABI order; this is not language type
+inference or a function-name registry. Descriptor/provider policy and scalar
+conversion remain adapter-owned. Allocator, aggregate and pointer-return handle
+conventions require a separate contract rather than implicit admission. Batched
+fallback loops must share one staging scope for the whole batch before migration:
+staging a full backing array per head would introduce severe copy amplification.
+`with-staged-pointers!` supplies that synchronous batch boundary through the same
+ownership engine: intermediate writes remain visible to later native calls,
+heap publication happens only when the whole operation succeeds, and borrowed
+staging closes on every exit. Caller-owned native writes remain nontransactional.
+The callback must not retain borrowed storage or launch asynchronous work.
 
 Execution scheduling is a distinct backend-neutral lowering. An `ExecutionPlan`
 assigns operations to logical queue classes and connects them with logical

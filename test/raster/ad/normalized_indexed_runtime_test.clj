@@ -1,8 +1,11 @@
 (ns raster.ad.normalized-indexed-runtime-test
   (:require [clojure.test :refer [deftest is]]
             [raster.ad.normalized-scalar :as normalized]
+            [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.normalized-map-runtime :as runtime]
             [raster.ad.normalized-indexed-map-test :as construction]
+            [raster.numeric :as numeric]
+            [raster.par :as par]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -15,6 +18,120 @@
 (defn- reason [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 (defn- gradient [prepared pullback dy]
   (nth (pullback dy) (.indexOf ^java.util.List (:inputs prepared) 'data)))
+
+(deftest indexed-execution-is-owned-by-the-canonical-envelope
+  (let [evidence (bundle :double :long 'n 'm)
+        owner (atom nil) validated (atom []) materializations (atom 0)
+        adapt canonical/adapt-indexed-map validate canonical/validate!
+        materialize route/materialize-host-indexed-map]
+    (with-redefs [canonical/adapt-indexed-map
+                  (fn [b] (let [result (adapt b)] (reset! owner result) result))
+                  canonical/validate!
+                  (fn [b] (swap! validated conj b) (validate b))
+                  route/materialize-host-indexed-map
+                  (fn [p] (swap! materializations inc) (materialize p))]
+      (let [prepared (runtime/prepare evidence)
+            preparation-proofs (count @validated)
+            preparation-materializations @materializations
+            input (args prepared {'n (long 2) 'indices (long-array [1 1])
+                                  'data (double-array [3.0 5.0 7.0])})
+            [output pb] ((:vjp prepared) input)
+            g (gradient prepared pb (double-array [1.0 2.0]))
+            [jy tangent] ((:jvp prepared) input (double-array [0.25 0.5 0.75]))]
+        (is (= [5.0 5.0] (vec output) (vec jy)))
+        (is (= [0.0 3.0 0.0] (vec g)))
+        (is (= [0.5 0.5] (vec tangent)))
+        (is (= (mapv :id (get-in @owner [:interface :inputs])) (:inputs prepared)))
+        (is (= 2 preparation-proofs) "adapter canonical proof plus independent post-capture proof")
+        (is (= preparation-proofs (count @validated)) "no hot canonical proof replay")
+        (is (= 3 preparation-materializations @materializations) "only three generated projections, none hot")
+        (is (every? #(identical? @owner %) @validated)
+            "preparation and execution validate the same canonical owner, not a legacy facet")))))
+
+(deftest indexed-success-is-fenced-and-original-failure-remains-primary
+  (let [prepared (runtime/prepare (bundle :double :long 'n 'm))
+        input (args prepared {'n (long 1) 'indices (long-array [0]) 'data (double-array [2.0 3.0])})
+        [_ pb] ((:vjp prepared) input)
+        invoke-var #'runtime/invoke invoke @invoke-var
+        baseline (normalized/revisions)]
+    (doseq [operation [#((:vjp prepared) input)
+                       #((:jvp prepared) input (double-array 2))
+                       #(pb (double-array [1.0]))]]
+      (let [current (atom baseline)]
+        (with-redefs-fn {#'normalized/revisions #(deref current)
+                        invoke-var (fn [& xs]
+                                     (let [result (apply invoke xs)]
+                                       (swap! current update :template-revision inc)
+                                       result))}
+          #(is (= :ad-normalized-stale-rules (reason operation))))))
+    (let [current (atom baseline) failure (ex-info "original indexed projection failure" {})]
+      (with-redefs-fn {#'normalized/revisions #(deref current)
+                      invoke-var (fn [& _]
+                                   (swap! current update :template-revision inc)
+                                   (throw failure))}
+        #(is (identical? failure (try ((:vjp prepared) input) nil (catch Throwable e e))))))))
+
+(deftest canonical-runtime-contract-tampering-refuses-before-compilation
+  (let [evidence (bundle :double :long 'n 'm)
+        owner (canonical/adapt-indexed-map evidence)
+        [destination _] (first (:physical-bindings owner))]
+    (doseq [changed [(assoc-in owner [:interface :active-inputs] '[indices])
+                     (assoc-in owner [:interface :cotangent-input :value :shape] '[m])
+                     (assoc-in owner [:residual-bindings 'indices :origin :input] 'data)
+                     (assoc-in owner [:residual-bindings 'indices :id] 'data)
+                     (assoc-in owner [:physical-bindings destination :requirement :exclusive] false)
+                     (assoc-in owner [:physical-bindings destination :consumer :result] destination)]]
+      (let [changed (assoc changed :certificate (#'canonical/certificate changed))
+            compiled (atom 0)]
+        (with-redefs-fn {#'canonical/adapt-indexed-map (constantly changed)
+                        #'runtime/compile-projection (fn [& _] (swap! compiled inc))}
+          #(do
+             (is (= :ad-program-bundle-correspondence (reason (fn [] (runtime/prepare evidence)))))
+             (is (zero? @compiled))))))))
+
+(deftest indexed-prepared-owner-captures-read-update-and-host-macro-dependencies
+  (let [prepared (runtime/prepare (bundle :double :long 'n 'm))
+        input (args prepared {'n (long 1) 'indices (long-array [0]) 'data (double-array [2.0 3.0])})
+        [_ pb] ((:vjp prepared) input)]
+    (doseq [dependency [#'clojure.core/aget #'numeric/+ #'par/map-void!]]
+      (let [metadata (meta dependency)]
+        (try
+          (with-redefs-fn {dependency (fn [& _] nil)}
+            #(do
+               (is (= :ad-normalized-execution-callee (reason (fn [] ((:vjp prepared) input)))))
+               (is (= :ad-normalized-execution-callee (reason (fn [] ((:jvp prepared) input (double-array 2))))))
+               (is (= :ad-normalized-execution-callee (reason (fn [] (pb (double-array [1.0]))))))))
+          ;; Restoring a macro's root may clear its macro flag. Restore exact fixture
+          ;; metadata AFTER with-redefs, not an assumed hand-written flag.
+          (finally (reset-meta! dependency metadata)))))
+    (is (= [2.0] (vec (first ((:vjp prepared) input)))))))
+
+(deftest indexed-original-read-alias-is-not-erased-by-preparation
+  (let [source-ns (create-ns (gensym "raster-indexed-source-alias-"))]
+    (try
+      (binding [*ns* source-ns] (clojure.core/refer 'clojure.core))
+      (let [source (#'construction/indexed-map :double :long 'n 'm)
+            [equation] (soac/equations source)
+            {:keys [kind attributes arrays captures lambda]} (soac/operation-parts equation)
+            {:keys [parameters]} (soac/lambda-parts lambda)
+            aliased (soac/make (soac/facts source)
+                              [(list '= (second equation) (nth equation 2)
+                                     (list kind attributes arrays captures
+                                           (soac/lambda-form parameters '[(aget data-array index)])))]
+                              (soac/outputs source))
+            evidence (normalized/linearize-indexed-map-program aliased source-ns)
+            prepared (runtime/prepare evidence)
+            input (args prepared {'n (long 1) 'indices (long-array [0]) 'data (double-array [2.0 3.0])})
+            [_ pb] ((:vjp prepared) input)]
+        (ns-unmap source-ns 'aget)
+        (intern source-ns 'aget (fn [& _] 99.0))
+        (is (= :ad-normalized-execution-callee (reason #((:vjp prepared) input))))
+        (is (= :ad-normalized-execution-callee (reason #((:jvp prepared) input (double-array 2)))))
+        (is (= :ad-normalized-execution-callee (reason #(pb (double-array [1.0])))))
+        (ns-unmap source-ns 'aget)
+        (binding [*ns* source-ns] (clojure.core/refer 'clojure.core :only '[aget]))
+        (is (= [2.0] (vec (first ((:vjp prepared) input))))))
+      (finally (remove-ns (ns-name source-ns))))))
 
 (deftest indexed-runtime-owns-snapshot-and-every-pullback-destination
   (doseq [[dt array cast] [[:double double-array double] [:float float-array float]]

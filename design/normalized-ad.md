@@ -1,5 +1,21 @@
 # Normalized AD design proposal
 
+## Current implementation boundary
+
+Normalized AD remains opt-in; the source AD engine remains the default and independent oracle.
+The checked scalar lane supplies derivation evidence to three bounded host families: pure map,
+map followed by ordered additive sum, and functional indexed map. Those families now execute
+through one canonical program/interface/residual owner. Preparation retains full validation;
+hot calls check compiler/rule epochs and captured executable identities without replaying proofs.
+Indexed pullbacks additionally require private index snapshots and a fresh typed-zero physical
+gradient owner on every call. These are sequential lifetime contracts, not concurrent mutation
+or asynchronous ownership guarantees.
+
+General equation composition, conditional/loop AD regions, device execution of these normalized
+families and default-engine migration remain separate gates. Existing real-weight training
+acceptance is still open. The sections below describe the individual construction checkpoints;
+an adapter's lack of runtime effects does not mean its checked envelope is unused by the runtime.
+
 ## Equation projection and shape facts
 
 `soac/equation-subprogram(s)` keeps executable inputs distinct from shape-only facts. When an
@@ -55,7 +71,8 @@ stream described below. This establishes correspondence to the currently registe
 not independent proof of custom-rule mathematics or a capability granted by producer certification.
 
 This thin migration adapter adds no runtime mode, parser, rule registry, cache, equation
-composition or fusion permission. Old APIs and runtimes remain unchanged. The nested evidence
+composition or fusion permission. The adapter itself does not change source admission or public
+surface semantics. The nested evidence
 and family validators may retire only after a common program validator independently owns the
 same source/derivative/residual obligations and the existing numerical/refusal gates agree.
 `adapt-map-sum` uses the same canonical projection for an existing admitted map→ordered sum.
@@ -82,8 +99,9 @@ rules. Full typed programs, tangent/seed IDs and residual ordering must agree se
 Rule/definition epochs are checked before and after replay. Existing bundles without generation
 evidence refuse rather than receiving a new certificate or inferred proof.
 
-This deliberately replays rule emitters on every validation, including runtime primal and
-pullback boundaries; there is no opaque validation cache or safety skip. Emitters must remain
+Every explicit validation replays rule emitters; there is no opaque validation cache or safety
+skip. Prepared host family execution instead uses the captured lifetime fence described above,
+without invoking full validation on each primal or pullback call. Emitters must remain
 deterministic under their registered contract, and their original failures propagate. Agreement
 with current registered derivative arithmetic is not independent proof of its mathematics,
 nor floating reassociation permission or completion of the AD/training migration. Exact SFT
@@ -118,7 +136,7 @@ mutated during acquisition. Device execution, gather→sum and public-engine int
 separate gates. The unchanged real-weight Gemma gate remains FAILED (11/28); host indexed-map
 controls are not model or exact SFT acceptance.
 
-Status: architecture assessed against Raster main
+Initial assessment checkpoint: Raster main
 `642b5f0c0aad7c49f223357a796ce09c900e7c1c`, with an initial opt-in scalar implementation.
 This is not a replacement for the compiler campaign or completion of normalized AD. The
 unpublished scoped-helper experiment remains held by a checkpoint refusal regression.
@@ -539,10 +557,27 @@ runtime dependency is loaded before bundle epochs are established. The post-capt
 proof still checks the realized selected implementation; a later replacement refuses.
 persistent alias root replacement therefore refuses even without an epoch change.
 This is a sequential fence, not a concurrent raw Var mutation/ABA or callable-internal
-mutation guarantee. Indexed execution retains its existing per-invocation validation.
-The delegated validator replays existing registered scalar derivative rules during
-preparation with their exact recorded typed IDs; that correspondence is not independent
-proof of custom-rule mathematics and adds no hot replay. This adds no cache,
+mutation guarantee. Indexed preparation uses the same fence, capturing the exact original
+read/alias from its checked single-read, empty-local source lambda as well as the three
+generated host projections. The scalar identity lane alone is not source dependency evidence.
+Full canonical validation after capture binds that fence to the accepted program and physical
+contracts. Indexed hot calls perform no proof replay or materialization; exact carrier/bounds,
+snapshot and fresh-zero ownership checks remain. Original projection failures stay primary.
+Extending indexed source admission beyond this lambda requires revisiting dependency capture.
+Its physical typed-zero binding is an obligation checked against the canonical
+transpose destination/result alias, not an allocation receipt.
+Full scalar validation replays the existing registered derivative rules with the exact
+recorded typed IDs. Within each proof, a request-local collector retains the first resolved
+operation/receiver Var, effective value and metadata actually used by the selected-call
+checks. Later disagreements cannot replace that observation. After the original validation,
+certificate and derivation checks succeed, the proof rechecks those identities; earlier
+refusals and callback exceptions retain precedence. Execution capture shares the same
+first-observation comparison, without a serialized receipt or validation cache.
+This strengthens each proof's sequential lifetime only: it does not span separate proof
+and projection phases, establish concurrent/ABA safety, or independently prove custom-rule
+mathematics. Indexed direct-read admission is not covered by this scalar observation
+collector; its original read remains a dependency of the prepared execution guard.
+Both adapter proofs and the post-capture proof remain required. This adds no cache,
 GPU session or derivative rule owner. General loops, public `deftm` convenience,
 higher-order AD of runtime closures and asynchronous residual ownership remain
 separate capability gates.
@@ -574,7 +609,17 @@ fresh interfaces and construction correspondence, including semantic metadata an
 owned residuals. Known frontend binding bookkeeping is projected only after its
 complete two-binding envelope and absent host activity have been checked; unknown
 attributes are not stripped. No derivative rules or numerical interpreter are added.
-The existing host consumer now chooses the checked sum programs when present. Shared
+The host consumer adapts admitted legacy evidence once at its preparation boundary. All
+three supported families then execute the canonical primal/linear/transpose programs,
+ordered input/value interfaces, owned residual bindings and physical requirements. It
+does not rebuild a separate runtime interface or execute a legacy program facet. Family
+source/derivative validators remain the mathematical authority; they cannot be retired
+merely because execution no longer reads their storage representation. Indexed destination
+and result IDs remain distinct, and every pullback allocates a fresh typed-zero destination.
+No caller array is retained as a residual. This does not add a runtime mode or general AD
+composition.
+
+Shared
 host materialization assembles the tuple map and original reduction in equation order,
 with one exact-ID source transport; it adds no numerical evaluator or reduction loop.
 The generated reduction projects only the exact frontend prefix bookkeeping already

@@ -67,7 +67,7 @@
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"
                     "--add-modules=jdk.incubator.vector"]
          :main-opts ["-m" "nrepl.cmdline" "--port" "7899"]}
-  ;; JVM/bytecode + WASM + Vulkan/WebGPU surface, served from the BUILT LEAN JAR instead of
+  ;; JVM/bytecode + WASM + WebGPU surface, served from the BUILT LEAN JAR instead of
   ;; src/. `:replace-paths` REPLACES the project paths (an :extra-paths alias cannot drop
   ;; src/), so raster.* resolves from target/raster-lean.jar — no src/ on the classpath.
   ;; Build it first:   clojure -T:build lean-jar   (refreshes target/raster-lean.jar)
@@ -75,9 +75,7 @@
   ;;   clojure -M:lean                    ; REPL against the jar (no src)
   ;;   clojure -M:lean:repl               ; nREPL :7899 against the jar
   ;;   clojure -M:lean:test               ; test suite against the jar
-  ;;   clojure -M:lean:vulkan:vulkan-macos-arm64:valhalla -m valley.vk-walk
-  ;;                                      ; launch Valley from the jar (JDK 28)
-  :lean {:replace-paths ["examples" "target/raster-lean.jar"]
+  :lean {:replace-paths ["examples" "test" "target/raster-lean.jar"]
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"
                     "--add-modules=jdk.incubator.vector"
                     "-Xss8m"]}

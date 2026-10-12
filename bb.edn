@@ -1,86 +1,32 @@
-;; Development launchers for the cross-platform showcase games.
+;; Development launchers for the Valley voxel game (browser + desktop).
 ;;
-;;   bb valley.jvm       Valley on JVM/Vulkan + live-reload nREPL (blocks)
 ;;   bb valley.web       Valley on WebGPU — shadow-cljs watch (blocks)
+;;   bb valley.repl      shadow-cljs browser REPL for Valley (needs valley.web + Chrome)
+;;   bb valley.jvm       Valley on JVM/Vulkan, macOS Apple Silicon (blocks)
 ;;   bb valley.wasm      Regenerate the browser wasm kernels + cljs shim
-;;   bb valley.aot       Build the AOT uberjar (java -jar target/valley.jar)
 ;;
-;; Both games share examples/valley/*.cljc; see examples/valley/README.md.
-;;
-;; The nREPL boot below is EMBEDDED here and passed to the game JVM as inline
-;; `-e` code — there is no helper script on disk. It must run inside the GAME
-;; JVM (not in bb): on macOS GLFW needs the process's first thread, and only
-;; an nREPL in that same JVM can push `(require 'valley.ui :reload)` into the
-;; running frame loop.
+;; Valley shares examples/valley/*.cljc; see examples/valley/README.md.
+;; Web Valley runs in the browser (WebGPU + wasm); `valley.jvm` runs the same
+;; shell on the desktop (Vulkan via MoltenVK on macOS).
 {:paths ["examples"]
  :tasks
  {:init (do
           (require '[babashka.fs :as fs]
-                   '[babashka.process :as p]
-                   '[clojure.string :as str]
-                   '[clojure.walk :as walk])
-          (def vk-modules ":vulkan:vulkan-macos-arm64:valhalla")
-          (defn int-arg [a]
-            (try (parse-long a) (catch Exception _ nil)))
+                   '[babashka.process :as p])
           (defn die! [& msg]
             (binding [*out* *err*] (apply println msg))
-            (System/exit 1))
-          (def live-boot-form
-            '(do
-               (require (quote [nrepl.server :as nrepl]))
-               (let [s (nrepl/start-server :port 7901)]
-                 (println (str "nREPL server started on port " (:port s)
-                               " - connect: bb repl --connect " (:port s)))
-                 (println "Valley: game starting on the main thread"
-                          "(close the window to stop)")
-                 (flush)
-                 (try
-                   ((requiring-resolve (quote valley.vk-walk/-main)))
-                   (finally
-                     (nrepl/stop-server s)
-                     (shutdown-agents)))))))
+            (System/exit 1)))
 
-  ;; ---- Valley (voxel world: one .cljc codebase, two backends) ---------------
-  valley.jvm
-  {:doc "Valley (JVM/Vulkan) + live-reload nREPL inside the game JVM.
-         Blocks until the window closes.
-         Usage: bb valley.jvm [aliases] [port]
-           aliases  extra -M aliases, colon-separated (leading ':' ok),
-                    resolved against your deps.edn — e.g. repl/tools:lib/core.
-                    Must not define :main-opts (see :repl/cli).
-           port     nREPL port (default 7901).
-         Reload: edit examples/valley/*.cljc, then bb repl --connect <port>
-         and (require 'valley.ui :reload)."
-   :task (let [args *command-line-args*
-               port (or (some int-arg args) 7901)
-               extra (->> args
-                          (remove int-arg)
-                          (remove str/blank?)
-                          (str/join ":"))
-               modules (str "-M:" vk-modules
-                            (when-not (str/blank? extra)
-                              (str ":" (if (str/starts-with? extra ":")
-                                         (subs extra 1)
-                                         extra))))
-               nrepl-dep "{:deps {nrepl/nrepl {:mvn/version \"RELEASE\"}}}"
-               boot (walk/postwalk-replace {7901 port} live-boot-form)]
-           (println (str "▶ Valley (JVM/Vulkan) — nREPL on :" port
-                         (when-not (str/blank? extra)
-                           (str " — +" extra))))
-           (println (str "  edit examples/valley/*.cljc, then:"
-                         "  bb repl --connect " port
-                         "   # => (require 'valley.ui :reload)"))
-           (let [{:keys [exit]} (p/shell {:continue true}
-                                         "clojure" "-Sdeps" nrepl-dep
-                                         modules
-                                         "-e" (pr-str boot))]
-             (System/exit exit)))}
-
+  ;; ---- Valley (voxel world: browser WebGPU/wasm + desktop JVM/Vulkan) ---------
   valley.web
   {:doc "WebGPU dev server for Valley (shadow-cljs watch, hot reload).
          Blocks; http://localhost:8080/valley-walk.html
          Needs a one-time npm install in examples/asteroids/web;
-         auto-runs valley.wasm if the kernels are missing."
+         auto-runs valley.wasm if the kernels are missing.
+         REPL: with this running and the page open in Chrome, run
+         `bb valley.repl` (or: cd examples/asteroids/web &&
+         npx shadow-cljs cljs-repl cvalley-walk) and eval —
+         e.g. (js/document.getElementById \"game\")."
    :task (let [web "examples/asteroids/web"]
            (when-not (fs/exists? (fs/file web "node_modules"))
              (die! "node modules missing — run once:"
@@ -88,14 +34,41 @@
            (when-not (fs/exists? (fs/file web "public" "valley_kernels.wasm"))
              (println "wasm kernels missing — generating first"
                       "(bb valley.wasm)…")
-             (p/shell "clojure" "-M:vulkan" "examples/valley/gen.clj"))
+             (p/shell "clojure" "-Sdeps" "{:paths [\"src\" \"examples\"]}"
+                      "-M" "examples/valley/gen.clj"))
            (println "▶ WebGPU dev server (hot reload):"
                     "http://localhost:8080/valley-walk.html")
            (println "  edits in examples/valley/*.cljc or"
                     "examples/asteroids/web/src push into the open page")
+           (println "  REPL: open the page in Chrome, then in another terminal:"
+                    "bb valley.repl")
            (let [{:keys [exit]} (p/shell {:continue true :dir web}
                                          "npx" "shadow-cljs" "watch"
                                          "cvalley-walk")]
+             (System/exit exit)))}
+
+  valley.repl
+  {:doc "shadow-cljs browser REPL for Valley (evals in Chrome).
+         Needs `bb valley.web` running and valley-walk.html open in Chrome.
+         Try: (js/document.getElementById \"game\")."
+   :task (let [web "examples/asteroids/web"]
+           (when-not (fs/exists? (fs/file web "node_modules"))
+             (die! "node modules missing — run once:"
+                   "(cd examples/asteroids/web && npm install)"))
+           (println "▶ Valley browser REPL (Chrome must have valley-walk.html open)")
+           (let [{:keys [exit]} (p/shell {:continue true :dir web}
+                                         "npx" "shadow-cljs" "cljs-repl"
+                                         "cvalley-walk")]
+             (System/exit exit)))}
+
+  valley.jvm
+  {:doc "Valley on JVM/Vulkan (macOS Apple Silicon; needs: brew install molten-vk).
+         Blocks until the window closes."
+   :task (do
+           (println "▶ Valley (JVM/Vulkan) — close the window to stop")
+           (let [{:keys [exit]} (p/shell {:continue true}
+                                         "clojure" "-M:vulkan:vulkan-macos-arm64"
+                                         "-m" "valley.vk-walk")]
              (System/exit exit)))}
 
   valley.wasm
@@ -106,20 +79,6 @@
            (println "▶ regenerating valley wasm kernels into"
                     "examples/asteroids/web")
            (let [{:keys [exit]} (p/shell {:continue true}
-                                         "clojure" "-M:vulkan"
-                                         "examples/valley/gen.clj")]
-             (System/exit exit)))}
-
-  valley.aot
-  {:doc "Build the AOT uberjar target/valley.jar (Valley + all deps).
-         AOT-compiles the valley namespaces and bundles the LWJGL
-         natives; the macOS entry re-execs with -XstartOnFirstThread.
-         Also writes target/aot-explain.txt — the
-         explain-pipeline lowering report for every Valley deftm kernel.
-         Run:  java -jar target/valley.jar"
-   :task (do
-           (println "▶ building Valley AOT uberjar (target/valley.jar)")
-           (let [{:keys [exit]} (p/shell {:continue true}
-                                         "clojure" "-J-Xmx4g"
-                                         "-T:build" "valley-uber")]
+                                         "clojure" "-Sdeps" "{:paths [\"src\" \"examples\"]}"
+                                         "-M" "examples/valley/gen.clj")]
              (System/exit exit)))}}}

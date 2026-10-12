@@ -1,6 +1,8 @@
 (ns raster.compiler.core.inference-test
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.core.inference :as inf]))
+            [raster.compiler.core.inference :as inf]
+            [raster.numeric]
+            [raster.math]))
 
 ;; Helper to build a minimal type-env for infer-binding-tag
 (defn- type-env

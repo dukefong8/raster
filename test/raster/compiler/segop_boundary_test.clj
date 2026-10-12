@@ -18,6 +18,7 @@
    Map and reduction are full conversions: an unrepresentable SegOp is an illegal remaining
    operation with no alternate emitter."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.backend-guard :as guard]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
@@ -151,19 +152,22 @@
         (is (some? (:fallback d)) "and what happens instead — a stated outcome, not an absence"))))))
 
 (deftest direct-offset-map-enters-the-typed-boundary-before-compatibility
-  (let [source '(raster.par/map! out i n :offset base float (aget x i))
-        opts {:target-device :ze:0
-              :dtype :float
-              :array-types {'out :float 'x :float}
-              :scalar-types {'n :long 'base :long}}
-        scheduled (with-redefs [soac/par-form->soac
-                                (fn [& _]
-                                  (throw (AssertionError. "legacy SOAC was constructed")))]
-                    (slp/schedule-single-operation 'out source opts))
-        operation (first (:operations scheduled))
-        emitted ((requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
-                 source :dtype :float :device-id :ze:0 :min-elements 0
-                 :scalar-types (:scalar-types opts) :array-types (:array-types opts))]
+  (when-let [opencl-pass (guard/resolve-or-skip!
+                          "direct-offset-map"
+                          'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
+    (let [source '(raster.par/map! out i n :offset base float (aget x i))
+          opts {:target-device :ze:0
+                :dtype :float
+                :array-types {'out :float 'x :float}
+                :scalar-types {'n :long 'base :long}}
+          scheduled (with-redefs [soac/par-form->soac
+                                  (fn [& _]
+                                    (throw (AssertionError. "legacy SOAC was constructed")))]
+                      (slp/schedule-single-operation 'out source opts))
+          operation (first (:operations scheduled))
+          emitted (opencl-pass
+                   source :dtype :float :device-id :ze:0 :min-elements 0
+                   :scalar-types (:scalar-types opts) :array-types (:array-types opts))]
     (is (some? (:algorithm scheduled)))
     (is (= :typed-soac (get-in operation [:algorithm-dialect])))
     (is (= :unique (:write-conflict operation)))
@@ -172,7 +176,7 @@
       (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
       (is (re-find #"out_\[.*base.*rstr_i" kernel-source))
       (is (not (re-find #"inout_result\[idx\] =" kernel-source))
-          "a unique scatter must not acquire a second implicit dense store"))))
+          "a unique scatter must not acquire a second implicit dense store")))))
 
 (deftest direct-single-operation-refuses-to-drop-hoisted-scalar-equations
   (let [source '(raster.par/map! out i (* n stride) float (aget x i))
@@ -206,26 +210,29 @@
         "the direct backend receives executable host control, not a source-free algorithm")))
 
 (deftest direct-backends-consume-the-complete-typed-mini-program
-  (let [source '(raster.par/map! out i (* n stride) float (aget x i))
-        opts [:dtype :float :min-elements 0
-              :array-types {'out :float 'x :float}
-              :scalar-types {'n :long 'stride :long}]
-        [gpu jvm]
-        (with-redefs [soac/par-form->soac
-                      (fn [& _]
-                        (throw (AssertionError. "legacy SOAC was constructed")))]
-          [(apply (requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
-                  source :device-id :ze:0 opts)
-           (apply (requiring-resolve 'raster.compiler.backend.jvm.par-simd/simd-pass)
-                  source opts)])]
-    (doseq [{:keys [form stats]} [gpu jvm]]
-      (is (= :typed-soac (get-in stats [:direct-scheduling :route])))
-      (is (= 1 (get-in stats [:direct-scheduling :typed-scalar-equations])))
-      (is (some #(and (symbol? %) (.startsWith (name %) "rstr_extent_"))
-                (take-nth 2 (second form)))
-          "the hoisted extent remains an executable binding in the backend form"))
-    (is (zero? (get-in gpu [:stats :fallback])))
-    (is (zero? (get-in jvm [:stats :fallback])))))
+  (when-let [opencl-pass (guard/resolve-or-skip!
+                          "direct-backends"
+                          'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
+    (let [source '(raster.par/map! out i (* n stride) float (aget x i))
+          opts [:dtype :float :min-elements 0
+                :array-types {'out :float 'x :float}
+                :scalar-types {'n :long 'stride :long}]
+          [gpu jvm]
+          (with-redefs [soac/par-form->soac
+                        (fn [& _]
+                          (throw (AssertionError. "legacy SOAC was constructed")))]
+            [(apply opencl-pass
+                    source :device-id :ze:0 opts)
+             (apply (requiring-resolve 'raster.compiler.backend.jvm.par-simd/simd-pass)
+                    source opts)])]
+      (doseq [{:keys [form stats]} [gpu jvm]]
+        (is (= :typed-soac (get-in stats [:direct-scheduling :route])))
+        (is (= 1 (get-in stats [:direct-scheduling :typed-scalar-equations])))
+        (is (some #(and (symbol? %) (.startsWith (name %) "rstr_extent_"))
+                  (take-nth 2 (second form)))
+            "the hoisted extent remains an executable binding in the backend form"))
+      (is (zero? (get-in gpu [:stats :fallback])))
+      (is (zero? (get-in jvm [:stats :fallback]))))))
 
 (deftest a-fatal-reason-still-escapes
   (testing "a violated invariant is not a missing lowering rule. Recording one as a conversion
@@ -259,9 +266,12 @@
         (is (= :no-soac-node (:reason (ex-data e))))))))
 
 (deftest the-gpu-door-records-conversion-declines
-  (testing "A form the SegOp path handles reports no decline at all."
-    (let [op (requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
-          r (op '(raster.par/map! O i 8192 nil (clojure.core/* i 2.0)) :dtype :double)]
+  ;; Guarding opencl-pass also loads its namespace, so the segop-attempt resolve below is safe.
+  (when-let [opencl-pass (guard/resolve-or-skip!
+                          "gpu-door"
+                          'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
+    (testing "A form the SegOp path handles reports no decline at all."
+      (let [r (opencl-pass '(raster.par/map! O i 8192 nil (clojure.core/* i 2.0)) :dtype :double)]
       (is (= 1 (:ze-maps (:stats r))) "still lowered through the SegOp path")
       (is (empty? (:segop-declined (:stats r))) "so nothing to explain"))
     (testing "and the recorder itself distinguishes decline from invariant violation"
@@ -289,27 +299,31 @@
           (is (thrown-with-msg? NullPointerException #"implementation bug"
                                 (attempt stats :segmap '(raster.par/map! O i 4 nil x) :double :none
                                          (fn [] (throw (NullPointerException.
-                                                        "implementation bug")))))))))))
+                                                        "implementation bug"))))))))))))
 
 (deftest direct-map-is-a-full-typed-conversion-with-no-legacy-emitter
-  (testing "the direct adapter does not need compatibility SOAC lowering for an admitted map"
-    (with-redefs [soac-lower/lower-soac (fn [& _] nil)]
-      (let [compiled ((requiring-resolve
-                       'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
-                      '(raster.par/map! out i n float (clojure.core/aget a i))
-                      :dtype :float :min-elements 0)]
-        (is (= 1 (get-in compiled [:stats :ze-maps])))
-        (is (= 1 (get-in compiled [:stats :segop-relowered])))))))
+  (when-let [opencl-pass (guard/resolve-or-skip!
+                          "direct-map"
+                          'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
+    (testing "the direct adapter does not need compatibility SOAC lowering for an admitted map"
+      (with-redefs [soac-lower/lower-soac (fn [& _] nil)]
+        (let [compiled (opencl-pass
+                        '(raster.par/map! out i n float (clojure.core/aget a i))
+                        :dtype :float :min-elements 0)]
+          (is (= 1 (get-in compiled [:stats :ze-maps])))
+          (is (= 1 (get-in compiled [:stats :segop-relowered]))))))))
 
 (deftest direct-reduction-is-a-full-typed-conversion-with-no-legacy-emitter
-  (testing "the direct adapter does not need compatibility SOAC lowering for an admitted reduction"
-    (with-redefs [soac-lower/lower-soac (fn [& _] nil)]
-      (let [compiled ((requiring-resolve
-                       'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
-                      '(raster.par/reduce acc 0.0 i n
-                                          (+ acc (clojure.core/aget a i)))
-                      :dtype :double :min-elements 0
-                      :array-types {'a :double} :scalar-types {'n :long})]
-        (is (= 1 (get-in compiled [:stats :ze-reduces])))
-        (is (= 1 (get-in compiled [:stats :segop-reused])))
-        (is (nil? (get-in compiled [:stats :segop-relowered])))))))
+  (when-let [opencl-pass (guard/resolve-or-skip!
+                          "direct-reduction"
+                          'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
+    (testing "the direct adapter does not need compatibility SOAC lowering for an admitted reduction"
+      (with-redefs [soac-lower/lower-soac (fn [& _] nil)]
+        (let [compiled (opencl-pass
+                        '(raster.par/reduce acc 0.0 i n
+                                            (+ acc (clojure.core/aget a i)))
+                        :dtype :double :min-elements 0
+                        :array-types {'a :double} :scalar-types {'n :long})]
+          (is (= 1 (get-in compiled [:stats :ze-reduces])))
+          (is (= 1 (get-in compiled [:stats :segop-reused])))
+          (is (nil? (get-in compiled [:stats :segop-relowered]))))))))

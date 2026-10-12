@@ -1,6 +1,7 @@
 (ns raster.par-test
   (:require [clojure.test :refer [deftest testing is are]]
             [clojure.string]
+            [raster.backend-guard :as guard]
             [raster.core :refer [deftm ftm]]
             [raster.par :as par]
             [raster.compiler.ir.par :as ir.par]))
@@ -471,23 +472,25 @@
 
 (deftest scatter-kernel-source-generation
   (testing "Scatter kernel generates valid OpenCL C source"
-    (require 'raster.compiler.reference.indexed-transfer-opencl)
-    (let [gen (resolve 'raster.compiler.reference.indexed-transfer-opencl/generate-par-scatter-kernel)
-          form '(raster.par/scatter! out src index 100)
-          kernel (gen form :dtype :float)]
-      (is (string? (:source kernel)))
-      (is (clojure.string/includes? (:source kernel) "__kernel void"))
-      (is (clojure.string/includes? (:source kernel) "atomic_add_float"))
-      (is (false? (:strided? kernel))))))
+    (when-let [gen (guard/resolve-or-skip!
+                    "scatter-source"
+                    'raster.compiler.reference.indexed-transfer-opencl/generate-par-scatter-kernel)]
+      (let [form '(raster.par/scatter! out src index 100)
+            kernel (gen form :dtype :float)]
+        (is (string? (:source kernel)))
+        (is (clojure.string/includes? (:source kernel) "__kernel void"))
+        (is (clojure.string/includes? (:source kernel) "atomic_add_float"))
+        (is (false? (:strided? kernel)))))))
 
 (deftest scatter-strided-kernel-source-generation
   (testing "Strided scatter kernel generates valid OpenCL C source"
-    (require 'raster.compiler.reference.indexed-transfer-opencl)
-    (let [gen (resolve 'raster.compiler.reference.indexed-transfer-opencl/generate-par-scatter-kernel)
-          form '(raster.par/scatter! out src index 100 4)
-          kernel (gen form :dtype :float)]
-      (is (clojure.string/includes? (:source kernel) "stride"))
-      (is (true? (:strided? kernel))))))
+    (when-let [gen (guard/resolve-or-skip!
+                    "scatter-strided-source"
+                    'raster.compiler.reference.indexed-transfer-opencl/generate-par-scatter-kernel)]
+      (let [form '(raster.par/scatter! out src index 100 4)
+            kernel (gen form :dtype :float)]
+        (is (clojure.string/includes? (:source kernel) "stride"))
+        (is (true? (:strided? kernel)))))))
 
 ;; ================================================================
 ;; Opencl-pass dispatch tests (verify pipeline integration)
@@ -566,7 +569,9 @@
 
 (deftest opencl-pass-reduce-by-key-dispatch
   (testing "opencl-pass dispatches reduce-by-key to GPU kernel"
-    (let [pass (requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
+    (when-let [pass (guard/resolve-or-skip!
+                     "reduce-by-key"
+                     'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
       (let [form '(raster.par/reduce-by-key out keys vals 1000 +)
             result (pass form :device-id :ze:0 :dtype :float :min-elements 0)
             kernel (first (:kernels result))]

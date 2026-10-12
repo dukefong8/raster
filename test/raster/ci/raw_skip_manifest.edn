@@ -2,7 +2,9 @@
  :description
  "Exact inventory of test code that prints a skip instead of reporting through the shared honest gates. Counts are compatibility debt: remove entries as sites migrate; never raise them without an explicit review."
  :sites
- {"test/raster/compiler/backend/gpu/contract_pipeline_device_test.clj"
+ {"test/raster/backend_guard.clj"
+  {:count 1 :class :shared-gate :reason "Backend-namespace presence gate for lean deployments without the compute-GPU/native-C toolchains"}
+  "test/raster/compiler/backend/gpu/contract_pipeline_device_test.clj"
   {:count 3 :class :device-test :reason "Level Zero device gate predates the shared probe"}
   "test/raster/compiler/backend/gpu/cuda_mma_compile_test.clj"
   {:count 1 :class :toolchain :reason "Optional nvcc execution gate"}

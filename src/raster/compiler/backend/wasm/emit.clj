@@ -820,7 +820,9 @@
     (let [h (first node)]
       (cond
         (= h 'clojure.core/aget) (simd-index-ok? i-sym (nth node 2))
-        (#{'long 'int 'double 'float} h) (simd-pure? i-sym (last node))
+        (or (#{'long 'int 'double 'float} h)
+            (#{'double 'float} (descriptor/cast-result-tag h)))
+        (simd-pure? i-sym (last node))
         (and (= 2 (count node)) (simd-suffix (ix/canonical h))) false  ; unary +/- unsupported
         (simd-op-of node) (every? #(simd-pure? i-sym %) (simd-op-args node))
         :else false))
@@ -882,7 +884,9 @@
         (cond
           (= h 'clojure.core/aget)
           (let [[_ arr idx] node] (into (addr ctx arr idx) (e/v128-load 0 0)))
-          (#{'long 'int 'double 'float} h) (emit-vexpr ctx lane-vt (last node))
+          (or (#{'long 'int 'double 'float} h)
+              (#{'double 'float} (descriptor/cast-result-tag h)))
+          (emit-vexpr ctx lane-vt (last node))
           :else
           (let [suf (simd-op-of node)
                 [o1 o2] (simd-op-args node)
@@ -996,6 +1000,9 @@
    (void), when (void), and scalar value expressions."
   [ctx node]
   (cond
+    ;; Literal nil is a void tail, not a scalar with a missing retained dtype.
+    ;; Value-position nil remains unsupported by emit-val/infer-vt.
+    (nil? node) [[] nil]
     (and (seq? node) (= 'dotimes (first node))) [(emit-dotimes ctx node) nil]
     ;; void `if` (no else) in tail position — a macroexpanded `when`/`when-let`.
     (and (seq? node) (= 'if (first node)) (= 3 (count node))) [(emit-effect ctx node) nil]

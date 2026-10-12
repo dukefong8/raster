@@ -18,12 +18,17 @@
     edges, so variables only attend to their Markov blanket.
 
   Variable states:
-    LATENT (0)       — denoised by the model
+    LATENT (0)       — denoised by the model, the only ones in the loss
     OBSERVED (1)     — clamped, provides conditioning signal
     MARGINALIZED (2) — excluded from representation and graph
-    INTERVENED (3)   — for causal do-calculus reasoning
+    INTERVENED (3)   — clamped to the intervention's value like an observation,
+                       with its own state embedding (do-calculus). Cutting
+                       the information flow to the intervened variable's
+                       parents needs the graph's parent structure, which the
+                       edge list does not carry.
 
-  Reference: 'Graphically Structured Diffusion Models' (Gruber et al.)"
+  Reference: Weilbach, Harvey & Wood, 'Graphically Structured Diffusion
+  Models', ICML 2023."
   (:refer-clojure :exclude [aget aset alength aclone])
   (:require [raster.core :as core :refer [deftm ftm]]
             [raster.arrays :refer [aget aset alength aclone alloc-like]]
@@ -49,23 +54,63 @@
 (def ^:const INTERVENED 3)
 (def ^:const N-STATES 4)
 
+(defn clamped?
+  "Whether a variable in `state` keeps its given value: an observation or an
+  intervention."
+  [state]
+  (or (== OBSERVED state) (== INTERVENED state)))
+
 ;; ================================================================
 ;; Marginalization: remove variables from graph and reindex
 ;; ================================================================
 
+(defn- elimination-fill-in
+  "Edges [a b] (a ≠ b) that eliminating the MARGINALIZED variables adds
+  between the variables that remain, in a deterministic order. Variables are
+  eliminated in index order: removing m connects every a with a → m to every
+  b with m → b, so information that flowed through m keeps a path. Fill-in
+  between variables marginalized later carries forward to the remaining
+  ones (variable elimination)."
+  [states src-edges dst-edges n-vars n-edges]
+  (let [marginalized? (fn [i] (== MARGINALIZED (aget states i)))
+        [ins outs] (loop [e 0 ins {} outs {}]
+                     (if (< e n-edges)
+                       (let [s (aget src-edges e) d (aget dst-edges e)]
+                         (if (== s d)
+                           (recur (inc e) ins outs)
+                           (recur (inc e) (update ins d (fnil conj #{}) s) (update outs s (fnil conj #{}) d))))
+                       [ins outs]))
+        original (set (map (fn [e] [(aget src-edges e) (aget dst-edges e)]) (range n-edges)))
+        [_ _ added]
+        (reduce (fn [[ins outs added] m]
+                  (let [as (disj (get ins m #{}) m)
+                        bs (disj (get outs m #{}) m)
+                        new (for [a as b bs :when (not= a b)] [a b])
+                        ins (reduce (fn [ins [a b]] (update ins b (fnil conj #{}) a)) ins new)
+                        outs (reduce (fn [outs [a b]] (update outs a (fnil conj #{}) b)) outs new)
+                        ;; m leaves the graph
+                        ins (reduce (fn [ins b] (update ins b disj m)) (dissoc ins m) bs)
+                        outs (reduce (fn [outs a] (update outs a disj m)) (dissoc outs m) as)]
+                    [ins outs (into added new)]))
+                [ins outs (sorted-set)]
+                (filter marginalized? (range n-vars)))]
+    (vec (remove (fn [[a b]] (or (marginalized? a) (marginalized? b) (contains? original [a b]))) added))))
+
 (defn marginalize-graph
-  "Remove MARGINALIZED variables from the graph, filter edges, and reindex.
+  "Remove MARGINALIZED variables from the graph and reindex.
 
   Variables with state=MARGINALIZED are excluded from the flat representation.
-  Edges touching marginalized nodes are removed. Remaining edges are reindexed
-  to the compact representation.
+  Edges touching marginalized nodes are removed, and the remaining variables
+  that were connected through them are connected directly
+  (`elimination-fill-in`, as GSDM's reference implementation does): without
+  it, marginalizing a variable that separates two others would cut the path
+  between them. Kept edges stay in their order; fill-in edges follow.
 
   Returns {:values double[], :spaces long[], :states long[],
            :src-edges long[], :dst-edges long[],
            :n-vars long, :n-edges long,
            :original-indices long[] (old index for each new index)}"
-  [^doubles values ^longs spaces ^longs states
-   ^longs src-edges ^longs dst-edges n-vars n-edges]
+  [values spaces states src-edges dst-edges n-vars n-edges]
   (let [n-vars (int n-vars)
         n-edges (int n-edges)
         ;; Build compact index: old -> new (-1 for marginalized)
@@ -92,29 +137,16 @@
                     (aset orig-indices j (long i))
                     (recur (inc i) (inc j)))
                 (recur (inc i) j))))
-        ;; Count valid edges first
-        new-n-edges (loop [e 0 cnt 0]
-                      (if (< e n-edges)
-                        (let [s (aget src-edges e)
-                              d (aget dst-edges e)]
-                          (if (and (>= (aget idx-map s) 0)
-                                   (>= (aget idx-map d) 0))
-                            (recur (inc e) (inc cnt))
-                            (recur (inc e) cnt)))
-                        cnt))
+        kept (filterv (fn [[s d]] (and (>= (aget idx-map s) 0) (>= (aget idx-map d) 0)))
+                      (map (fn [e] [(aget src-edges e) (aget dst-edges e)]) (range n-edges)))
+        edges (into kept (elimination-fill-in states src-edges dst-edges n-vars n-edges))
+        new-n-edges (count edges)
         new-src (long-array new-n-edges)
-        new-dst (long-array new-n-edges)
-        _ (loop [e 0 j 0]
-            (when (< e n-edges)
-              (let [s (aget src-edges e)
-                    d (aget dst-edges e)
-                    ns (aget idx-map s)
-                    nd (aget idx-map d)]
-                (if (and (>= ns 0) (>= nd 0))
-                  (do (aset new-src j ns)
-                      (aset new-dst j nd)
-                      (recur (inc e) (inc j)))
-                  (recur (inc e) j)))))]
+        new-dst (long-array new-n-edges)]
+    (dotimes [j new-n-edges]
+      (let [[s d] (nth edges j)]
+        (aset new-src j (aget idx-map s))
+        (aset new-dst j (aget idx-map d))))
     {:values new-values :spaces new-spaces :states new-states
      :src-edges new-src :dst-edges new-dst
      :n-vars (long new-n) :n-edges (long new-n-edges)
@@ -799,11 +831,13 @@
   t: timestep (double)
   src/dst-edges: [n_edges] (long[])
   n-vars, n-edges: sizes (after marginalization)"
-  [weights config values spaces states t src-edges dst-edges n-vars n-edges]
+  ([weights config values spaces states t src-edges dst-edges n-vars n-edges]
+   (gsdm-forward-dynamic weights config values spaces states t src-edges dst-edges n-vars n-edges
+                         (compute-position-embeddings spaces n-vars (:emb-dim config))))
+  ([weights config values spaces states t src-edges dst-edges n-vars n-edges pos-emb]
   (let [{:keys [emb-dim n-heads n-layers n-spaces n-states]} config
         n-states (or n-states N-STATES)
         ;; Compute position embeddings for current variable set
-        pos-emb (compute-position-embeddings spaces n-vars emb-dim)
         ;; Embed
         h (flat-embed values (:embed-space weights) spaces
                       (:embed-state weights) states pos-emb
@@ -833,7 +867,18 @@
       ;; Unembed
       (flat-unembed h (:unembed-Wu1 weights) (:unembed-bu1 weights)
                     (:unembed-Wu2 weights) (:unembed-bu2 weights)
-                    n-vars emb-dim))))
+                    n-vars emb-dim)))))
+
+(defn- select-position-rows
+  "The rows of the position embeddings `pos-emb` [n, emb-dim] of the variables
+  at `indices`, in order: positions computed on the full graph, so a
+  variable keeps its identity when others are marginalized."
+  [pos-emb indices emb-dim]
+  (let [d (long emb-dim)
+        out (double-array (* (alength ^longs indices) d))]
+    (dotimes [j (alength ^longs indices)]
+      (System/arraycopy pos-emb (* (aget ^longs indices j) d) out (* j d) d))
+    out))
 
 ;; ================================================================
 ;; DDPM sampling (inference)
@@ -870,6 +915,8 @@
         mg-n-vars (long (:n-vars mg))
         mg-n-edges (long (:n-edges mg))
         orig-indices ^longs (:original-indices mg)
+        mg-pos-emb (select-position-rows (compute-position-embeddings spaces n-vars (:emb-dim config))
+                                         orig-indices (:emb-dim config))
         ;; Normalize observed values if normalizer provided (2-pass)
         mg-normalizer (when normalizer
                         (let [mg-mean (double-array mg-n-vars)
@@ -895,26 +942,26 @@
         mg-values (if mg-normalizer
                     (normalize-2pass mg-values mg-normalizer mg-n-vars)
                     mg-values)
-        ;; Start from pure noise for latent, observed values for observed
+        ;; Start from pure noise for latent, the given values for clamped ones
         x (double-array mg-n-vars)]
     (dotimes [i mg-n-vars]
       (aset x i
-            (if (== (aget mg-states i) OBSERVED)
+            (if (clamped? (aget mg-states i))
               (aget mg-values i)
               (.nextGaussian ^java.util.Random rng))))
     ;; Reverse diffusion loop
     (loop [step (dec (int timesteps))]
       (when (>= step 0)
-        (let [;; Clamp observed before prediction
+        (let [;; Clamp observed and intervened values before prediction
               _ (dotimes [i mg-n-vars]
-                  (when (== (aget mg-states i) OBSERVED)
+                  (when (clamped? (aget mg-states i))
                     (aset x i (aget mg-values i))))
               ;; Predict x0 from current x_t
               pred-x0 (gsdm-forward-dynamic weights config x mg-spaces mg-states
-                                            (double step) mg-src mg-dst mg-n-vars mg-n-edges)
-              ;; Clamp prediction at observed positions
+                                            (double step) mg-src mg-dst mg-n-vars mg-n-edges mg-pos-emb)
+              ;; Clamp the prediction at clamped positions
               _ (dotimes [i mg-n-vars]
-                  (when (== (aget mg-states i) OBSERVED)
+                  (when (clamped? (aget mg-states i))
                     (aset ^doubles pred-x0 i (aget mg-values i))))
               ;; DDPM reverse step coefficients
               alpha-t (aget ^doubles alphas-cumprod step)
@@ -925,7 +972,7 @@
               ;; fixedlarge variance (DDPM Table 2): sigma^2 = beta_t
               sigma (if (pos? step) (Math/sqrt beta-t) 0.0)]
           (dotimes [i mg-n-vars]
-            (when (not= (aget mg-states i) OBSERVED)
+            (when (not (clamped? (aget mg-states i)))
               (let [mean (+ (* coeff-x0 (aget ^doubles pred-x0 i))
                             (* coeff-xt (aget x i)))
                     noise-i (if (pos? step) (* sigma (.nextGaussian ^java.util.Random rng)) 0.0)]
@@ -949,31 +996,27 @@
 ;; ================================================================
 
 (defn layer-spec
-  "HMap spec for one transformer block's weights."
-  []
-  '(HMap :mandatory
-         {:res-W1  (Param (Array double))  :res-b1  (Param (Array double))
-          :res-W2  (Param (Array double))  :res-b2  (Param (Array double))
-          :res-Wt  (Param (Array double))  :res-bt  (Param (Array double))
-          :res-g1  (Param (Array double))  :res-bn1 (Param (Array double))
-          :res-g2  (Param (Array double))  :res-bn2 (Param (Array double))
-          :attn-Wq (Param (Array double))  :attn-bq (Param (Array double))
-          :attn-Wk (Param (Array double))  :attn-bk (Param (Array double))
-          :attn-Wv (Param (Array double))  :attn-bv (Param (Array double))
-          :attn-g  (Param (Array double))  :attn-b  (Param (Array double))}))
+  "HMap spec for one transformer block's weights, arrays of `el` (double by
+  default; float for GPU training)."
+  ([] (layer-spec 'double))
+  ([el]
+   (let [p (list 'Param (list 'Array el))]
+     (list 'HMap :mandatory
+           (into {} (map (fn [k] [k p]))
+                 [:res-W1 :res-b1 :res-W2 :res-b2 :res-Wt :res-bt :res-g1 :res-bn1 :res-g2 :res-bn2
+                  :attn-Wq :attn-bq :attn-Wk :attn-bk :attn-Wv :attn-bv :attn-g :attn-b])))))
 
 (defn weights-spec
-  "HMap spec for the full GSDM weight tree at given n-layers."
-  [n-layers]
-  (let [ls (layer-spec)]
-    (list 'HMap :mandatory
-          {:temb-W1     '(Param (Array double))   :temb-b1     '(Param (Array double))
-           :temb-W2     '(Param (Array double))   :temb-b2     '(Param (Array double))
-           :embed-We    '(Param (Array double))   :embed-be    '(Param (Array double))
-           :embed-space '(Param (Array double))   :embed-state '(Param (Array double))
-           :unembed-Wu1 '(Param (Array double))   :unembed-bu1 '(Param (Array double))
-           :unembed-Wu2 '(Param (Array double))   :unembed-bu2 '(Param (Array double))
-           :layers      (list 'HVec (vec (repeat n-layers ls)))})))
+  "HMap spec for the full GSDM weight tree at given n-layers, arrays of `el`."
+  ([n-layers] (weights-spec n-layers 'double))
+  ([n-layers el]
+   (let [ls (layer-spec el)
+         p (list 'Param (list 'Array el))]
+     (list 'HMap :mandatory
+           (assoc (into {} (map (fn [k] [k p]))
+                        [:temb-W1 :temb-b1 :temb-W2 :temb-b2 :embed-We :embed-be :embed-space :embed-state
+                         :unembed-Wu1 :unembed-bu1 :unembed-Wu2 :unembed-bu2])
+                  :layers (list 'HVec (vec (repeat n-layers ls))))))))
 
 (defn flat->tree
   "Convert init-gsdm-weights output (flat keyword-keyed) into the tree shape
@@ -1058,3 +1101,372 @@
     (binding [*ns* (the-ns 'raster.dl.gsdm)]
       (eval form))
     (find-var (symbol "raster.dl.gsdm" (str sym)))))
+
+;; ================================================================
+;; Batched GSDM: B examples of equal size as one disjoint-union graph
+;;
+;; Nodes of all examples are stacked node-major, [B·n, emb-dim]; edges are
+;; offset into that stack, so graph attention never crosses examples.
+;; GroupNorm normalizes over the nodes of ONE example (as the reference's
+;; batch axis does): `node-group-norm` permutes to channel-first per example,
+;; [B, emb-dim, n], with a gather, runs group-norm with batch = B, and
+;; permutes back. The timestep is per example: its embedding, [B, emb-dim],
+;; reaches each node by a gather over the node's example index. Gathers carry
+;; their AD template (backward = scatter-add), so the batched model trains
+;; through the same compile-aot / compile-train-step paths.
+;; ================================================================
+
+(defn batch-layout
+  "Index arrays for B examples of n nodes each, emb-dim channels:
+  :node-example [B·n] (the example of each node), :to-cf and :to-nm, the
+  gathers from node-major [B·n, d] to channel-first [B, d, n] and back."
+  [batch n emb-dim]
+  (let [batch (long batch) n (long n) d (long emb-dim)
+        total (* batch n d)
+        to-cf (long-array total)
+        to-nm (long-array total)]
+    (dotimes [b batch]
+      (dotimes [c d]
+        (dotimes [i n]
+          (let [cf (+ (* b d n) (* c n) i)
+                nm (+ (* (+ (* b n) i) d) c)]
+            (aset to-cf cf nm)
+            (aset to-nm nm cf)))))
+    {:node-example (long-array (for [b (range batch) _ (range n)] b))
+     :to-cf to-cf
+     :to-nm to-nm}))
+
+(deftm node-group-norm
+  "GroupNorm of node-major features x [B·n, d] over the nodes of each
+  example separately."
+  (All [T] [x :- (Array T) gamma :- (Array T) beta :- (Array T)
+            to-cf :- (Array long) to-nm :- (Array long)
+            batch :- Long n-per :- Long emb-dim :- Long]
+       :- (Array T)
+       (let [total (* batch (* n-per emb-dim))
+             num-groups (n/max 1 (n/min 32 (quot emb-dim 2)))
+             cf (array-ops/gather x to-cf total total 1)
+             cf (nn/group-norm cf gamma beta batch emb-dim n-per num-groups 1e-5)]
+         (array-ops/gather cf to-nm total total 1))))
+
+(defn embed-timesteps
+  "Sinusoidal embeddings of the timesteps `ts` (B of them), as a double
+  array [B, dim]: sin in the first half of each row, cos in the second, as
+  `embed-timestep`. Data, computed before the model: the batched model takes
+  it as input, so reverse mode never sees it."
+  [ts dim]
+  (let [dim (long dim)
+        half-dim (quot dim 2)
+        log-scale (/ (Math/log 10000.0) (double (max 1 (dec half-dim))))
+        out (double-array (* (count ts) dim))]
+    (doseq [[b t] (map-indexed vector ts)
+            d (range half-dim)]
+      (let [angle (* (double t) (Math/exp (* (- (double d)) log-scale)))]
+        (aset out (+ (* b dim) d) (Math/sin angle))
+        (aset out (+ (* b dim) half-dim d) (Math/cos angle))))
+    out))
+
+(deftm timestep-mlp-batched
+  "timestep-mlp for B timesteps given by their sinusoidal embeddings
+  t-emb [B, emb_dim] (`embed-timesteps`): returns [B, emb_dim]."
+  (All [T] [t-emb :- (Array T) W1 :- (Array T) b1 :- (Array T)
+            W2 :- (Array T) b2 :- (Array T) batch :- Long emb-dim :- Long]
+       :- (Array T)
+       (let [h (nn/linear t-emb W1 b1 batch emb-dim emb-dim)
+             h (nn/silu h (* batch emb-dim))]
+         (nn/linear h W2 b2 batch emb-dim emb-dim))))
+
+(deftm resnet-block-batched
+  "resnet-block over B examples: per-example GroupNorm and timestep.
+  x [B·n, d], temb [B, d], node-example [B·n]."
+  (All [T] [x :- (Array T) temb :- (Array T) node-example :- (Array long)
+            to-cf :- (Array long) to-nm :- (Array long)
+            W1 :- (Array T) b1 :- (Array T)
+            W2 :- (Array T) b2 :- (Array T)
+            Wt :- (Array T) bt :- (Array T)
+            gamma1 :- (Array T) beta1 :- (Array T)
+            gamma2 :- (Array T) beta2 :- (Array T)
+            batch :- Long n-per :- Long emb-dim :- Long]
+       :- (Array T)
+       (let [n-nodes (* batch n-per)
+             total (* n-nodes emb-dim)
+             h (node-group-norm x gamma1 beta1 to-cf to-nm batch n-per emb-dim)
+             h (nn/silu h total)
+             h (nn/linear h W1 b1 n-nodes emb-dim emb-dim)
+             temb-proj (nn/silu temb (* batch emb-dim))
+             temb-proj (nn/linear temb-proj Wt bt batch emb-dim emb-dim)
+             ;; each node gets its example's row
+             temb-nodes (array-ops/gather temb-proj node-example batch n-nodes emb-dim)
+             h (array-ops/array-add h temb-nodes total)
+             h (node-group-norm h gamma2 beta2 to-cf to-nm batch n-per emb-dim)
+             h (nn/silu h total)
+             h (nn/linear h W2 b2 n-nodes emb-dim emb-dim)]
+         (array-ops/array-add x h total))))
+
+(deftm graph-attention-batched
+  "graph-attention-multihead over B examples: per-example GroupNorm, edges
+  offset into the stacked nodes."
+  (All [T] [h :- (Array T)
+            Wq :- (Array T) bq :- (Array T)
+            Wk :- (Array T) bk :- (Array T)
+            Wv :- (Array T) bv :- (Array T)
+            gamma :- (Array T) beta :- (Array T)
+            src-edges :- (Array long) dst-edges :- (Array long)
+            to-cf :- (Array long) to-nm :- (Array long)
+            batch :- Long n-per :- Long n-edges :- Long emb-dim :- Long n-heads :- Long]
+       :- (Array T)
+       (let [n-nodes (* batch n-per)
+             dk (quot emb-dim n-heads)
+             h-norm (node-group-norm h gamma beta to-cf to-nm batch n-per emb-dim)
+             Q (nn/linear h-norm Wq bq n-nodes emb-dim emb-dim)
+             K (nn/linear h-norm Wk bk n-nodes emb-dim emb-dim)
+             V (nn/linear h-norm Wv bv n-nodes emb-dim emb-dim)
+             raw-scores (array-ops/indexed-dot Q K dst-edges src-edges
+                                               n-nodes n-nodes n-edges dk emb-dim n-heads)
+             scores (array-ops/scale-clamp-exp raw-scores
+                                               (/ 1.0 (n/sqrt (double dk))) 5.0
+                                               (* n-edges n-heads))
+             Z (array-ops/scatter-add scores dst-edges n-nodes n-edges n-heads)
+             wV (array-ops/scatter-mul-add scores V dst-edges src-edges
+                                           n-nodes n-nodes n-edges dk emb-dim n-heads)
+             wV (array-ops/segment-div wV Z n-nodes emb-dim n-heads 1e-6)]
+         (array-ops/array-add h wV (* n-nodes emb-dim)))))
+
+(defn transformer-block-step-batched
+  "The batched layer step for `tree/scan-vec`, over arrays of `el` (double or
+  float): resnet-block-batched then graph-attention-batched. Defined (once
+  per element type) as a defmodel whose layer spec is `(layer-spec el)`."
+  [el]
+  (let [sym (symbol (str "transformer-block-step-batched-" el))]
+    (or (find-var (symbol "raster.dl.gsdm" (str sym)))
+        (let [a (list 'Array el)
+              form `(raster.params/defmodel ~sym
+                      [~'h :- ~a
+                       ~'layer :- (~'Params ~(layer-spec el))
+                       ~'temb :- ~a ~'node-example :- (~'Array ~'long)
+                       ~'to-cf :- (~'Array ~'long) ~'to-nm :- (~'Array ~'long)
+                       ~'src-edges :- (~'Array ~'long) ~'dst-edges :- (~'Array ~'long)
+                       ~'batch :- ~'Long ~'n-per :- ~'Long ~'n-edges :- ~'Long ~'emb-dim :- ~'Long ~'n-heads :- ~'Long]
+                      :- ~a
+                      (~'let [~'h-res (raster.dl.gsdm/resnet-block-batched
+                                       ~'h ~'temb ~'node-example ~'to-cf ~'to-nm
+                                       (:res-W1 ~'layer) (:res-b1 ~'layer)
+                                       (:res-W2 ~'layer) (:res-b2 ~'layer)
+                                       (:res-Wt ~'layer) (:res-bt ~'layer)
+                                       (:res-g1 ~'layer) (:res-bn1 ~'layer)
+                                       (:res-g2 ~'layer) (:res-bn2 ~'layer)
+                                       ~'batch ~'n-per ~'emb-dim)]
+                       (raster.dl.gsdm/graph-attention-batched
+                        ~'h-res
+                        (:attn-Wq ~'layer) (:attn-bq ~'layer)
+                        (:attn-Wk ~'layer) (:attn-bk ~'layer)
+                        (:attn-Wv ~'layer) (:attn-bv ~'layer)
+                        (:attn-g ~'layer) (:attn-b ~'layer)
+                        ~'src-edges ~'dst-edges ~'to-cf ~'to-nm
+                        ~'batch ~'n-per ~'n-edges ~'emb-dim ~'n-heads)))]
+          (binding [*ns* (the-ns 'raster.dl.gsdm)]
+            (eval form))
+          (find-var (symbol "raster.dl.gsdm" (str sym)))))))
+
+(defn make-gsdm-batched-loss
+  "The batched loss: B examples of n-per nodes as one disjoint-union graph,
+  one timestep per example (t-emb [B, emb-dim], `embed-timesteps`), the masked MSE over all their latent
+  nodes. Same weight tree as `make-gsdm-loss`. :dtype :float declares every
+  real array float (for GPU training: `rp/compile-train-step` with
+  :target-device and :dtype :float); the data and weights passed must then
+  be float arrays."
+  [{:keys [n-layers emb-dim n-heads n-spaces dtype]
+    :or {n-layers 2 emb-dim 8 n-heads 2 n-spaces 1 dtype :double}}]
+  (let [el (symbol (name dtype))
+        a (list 'Array el)
+        step-var (transformer-block-step-batched el)
+        w-spec (weights-spec n-layers el)
+        sym (symbol (str "gsdm-batched-loss-" n-layers "L-" emb-dim "d-" n-heads "h-" n-spaces "s-" (name dtype)))
+        form `(raster.core/deftm ~sym
+                [~'w :- ~w-spec
+                 ~'values :- ~a
+                 ~'spaces :- (~'Array ~'long)
+                 ~'target :- ~a
+                 ~'states :- (~'Array ~'long)
+                 ~'pos-emb :- ~a
+                 ~'src-edges :- (~'Array ~'long)
+                 ~'dst-edges :- (~'Array ~'long)
+                 ~'t-emb :- ~a
+                 ~'node-example :- (~'Array ~'long)
+                 ~'to-cf :- (~'Array ~'long)
+                 ~'to-nm :- (~'Array ~'long)
+                 ~'batch :- ~'Long
+                 ~'n-per :- ~'Long
+                 ~'n-edges :- ~'Long]
+                :- ~'Double
+                (~'let [~'emb-dim-val ~(long emb-dim)
+                        ~'n-heads-val ~(long n-heads)
+                        ~'n-spaces-val ~(long n-spaces)
+                        ~'n-states-val ~(long N-STATES)
+                        ~'n-total (~'* ~'batch ~'n-per)
+                        ~'h-init (raster.dl.gsdm/flat-embed
+                                  ~'values (:embed-space ~'w) ~'spaces
+                                  (:embed-state ~'w) ~'states ~'pos-emb
+                                  (:embed-We ~'w) (:embed-be ~'w)
+                                  ~'n-total ~'emb-dim-val ~'n-spaces-val ~'n-states-val)
+                        ~'temb (raster.dl.gsdm/timestep-mlp-batched
+                                ~'t-emb (:temb-W1 ~'w) (:temb-b1 ~'w)
+                                (:temb-W2 ~'w) (:temb-b2 ~'w) ~'batch ~'emb-dim-val)
+                        ~'h-final (raster.tree/scan-vec ~(symbol "raster.dl.gsdm" (str (.sym ^clojure.lang.Var step-var)))
+                                                        ~'h-init (:layers ~'w)
+                                                        ~'temb ~'node-example ~'to-cf ~'to-nm
+                                                        ~'src-edges ~'dst-edges
+                                                        ~'batch ~'n-per ~'n-edges ~'emb-dim-val ~'n-heads-val)
+                        ~'pred (raster.dl.gsdm/flat-unembed
+                                ~'h-final
+                                (:unembed-Wu1 ~'w) (:unembed-bu1 ~'w)
+                                (:unembed-Wu2 ~'w) (:unembed-bu2 ~'w)
+                                ~'n-total ~'emb-dim-val)]
+                       (raster.dl.array-ops/masked-mse-loss ~'pred ~'target ~'states ~'n-total)))]
+    (binding [*ns* (the-ns 'raster.dl.gsdm)]
+      (eval form))
+    (find-var (symbol "raster.dl.gsdm" (str sym)))))
+
+;; ================================================================
+;; Training: noised, conditioned examples in batches
+;; ================================================================
+
+(def default-mask-mix
+  "Condition-mask mixture (Simformer): the problem's own states (posterior),
+  all latent (joint), observed and latent swapped (likelihood), and each
+  variable observed with probability 1/2 (random)."
+  {:posterior 0.4 :joint 0.2 :likelihood 0.2 :random 0.2})
+
+(defn condition-states
+  "States for one example, drawn from `mask-mix` {kind weight} around the
+  problem's `default-states`. Clamped (OBSERVED or INTERVENED) and LATENT
+  variables are swapped by :likelihood; MARGINALIZED ones are kept."
+  [default-states mask-mix ^java.util.Random rng]
+  (let [kinds (vec (keys mask-mix))
+        total (reduce + (vals mask-mix))
+        u (* total (.nextDouble rng))
+        kind (loop [[k & more] kinds acc 0.0]
+               (let [acc (+ acc (get mask-mix k))]
+                 (if (or (nil? more) (< u acc)) k (recur more acc))))
+        out (aclone default-states)]
+    (dotimes [i (alength out)]
+      (let [s (aget out i)]
+        (when (not= MARGINALIZED s)
+          (aset out i
+                (long (case kind
+                        :posterior s
+                        :joint LATENT
+                        :likelihood (if (clamped? s) LATENT OBSERVED)
+                        :random (if (< (.nextDouble rng) 0.5) OBSERVED LATENT)))))))
+    out))
+
+(defn- marginalize-example
+  "`ex` with its states replaced by `states`, then `k` more of its variables,
+  chosen at random among those not marginalized already, MARGINALIZED; all
+  marginalized variables are removed (`marginalize-graph`, with fill-in).
+  :pos-emb holds the kept variables' positions on the full graph."
+  [ex states k emb-dim ^java.util.Random rng]
+  (let [n (long (:n-vars ex))
+        pos-emb (compute-position-embeddings (:spaces ex) n emb-dim)
+        st (aclone ^longs states)
+        kept (filterv #(not= MARGINALIZED (aget st (int %))) (range n))
+        chosen (take k (let [l (java.util.ArrayList. ^java.util.Collection kept)]
+                         (java.util.Collections/shuffle l rng)
+                         l))]
+    (doseq [i chosen] (aset st (int i) (long MARGINALIZED)))
+    (if (= n (count kept) (+ (count kept) (count chosen)))
+      (assoc ex :states st :pos-emb pos-emb)
+      (let [mg (marginalize-graph (:values ex) (:spaces ex) st (:src-edges ex) (:dst-edges ex) n (:n-edges ex))]
+        {:values (:values mg) :spaces (:spaces mg) :states (:states mg)
+         :src-edges (:src-edges mg) :dst-edges (:dst-edges mg)
+         :n-vars (:n-vars mg) :n-edges (:n-edges mg)
+         :pos-emb (select-position-rows pos-emb (:original-indices mg) emb-dim)}))))
+
+(defn training-batch
+  "Arguments of the batched loss (after the weights) for `batch` fresh
+  examples of `problem` (a fn of an rng, as `make-linear-gaussian-problem`),
+  each with its own condition mask and timestep t uniform on the schedule:
+  latent variables are noised to x_t, clamped ones keep x0, and the target is
+  x0. With `marginalized` k > 0, each example also marginalizes its own k
+  random variables, so all keep the same size. Every example of the problem
+  must have the same number of variables."
+  ([problem batch alphas-cumprod mask-mix emb-dim rng]
+   (training-batch problem batch alphas-cumprod mask-mix emb-dim rng 0))
+  ([problem batch alphas-cumprod mask-mix emb-dim ^java.util.Random rng marginalized]
+   (let [timesteps (alength ^doubles alphas-cumprod)
+         raw (vec (repeatedly batch #(problem rng)))
+         _ (when-not (apply = (map #(long (:n-vars %)) raw))
+             (throw (ex-info "A batch needs examples of one size" {:sizes (map :n-vars raw)})))
+         exs (mapv #(marginalize-example % (condition-states (:states %) mask-mix rng) marginalized emb-dim rng) raw)
+         _ (when-not (apply = (map #(long (:n-vars %)) exs))
+             (throw (ex-info "Marginalization left examples of different sizes" {:sizes (map :n-vars exs)})))
+         states (mapv :states exs)
+         n-per (long (:n-vars (first exs)))
+         ts (vec (repeatedly batch #(.nextInt rng timesteps)))
+         noised (mapv (fn [ex st t]
+                       (let [x0 ^doubles (:values ex)
+                             a (aget ^doubles alphas-cumprod t)
+                             xt (double-array n-per)]
+                         (dotimes [i n-per]
+                           (aset xt i (if (clamped? (aget ^longs st i))
+                                        (aget x0 i)
+                                        (+ (* (Math/sqrt a) (aget x0 i))
+                                           (* (Math/sqrt (- 1.0 a)) (.nextGaussian rng))))))
+                         xt))
+                     exs states ts)
+        offsets (map #(* % n-per) (range batch))
+        {:keys [node-example to-cf to-nm]} (batch-layout batch n-per emb-dim)]
+    [(double-array (mapcat seq noised))
+     (long-array (mapcat (comp seq :spaces) exs))
+     (double-array (mapcat (comp seq :values) exs))
+     (long-array (mapcat seq states))
+     (double-array (mapcat (comp seq :pos-emb) exs))
+     (long-array (mapcat (fn [ex o] (map #(+ % o) (:src-edges ex))) exs offsets))
+     (long-array (mapcat (fn [ex o] (map #(+ % o) (:dst-edges ex))) exs offsets))
+     (embed-timesteps (map double ts) emb-dim)
+     node-example to-cf to-nm
+     (long batch) n-per (long (reduce + (map :n-edges exs)))])))
+
+(deftm ema-update!
+  "ema ← mu·ema + one-minus-mu·w, in place; the rates in the element type."
+  (All [T] [ema :- (Array T) w :- (Array T) mu :- T one-minus-mu :- T n :- Long] :- (Array T)
+       (dotimes [i n]
+         (aset ema i (n/+ (n/* mu (aget ema i)) (n/* one-minus-mu (aget w i)))))
+       ema))
+
+(defn train-gsdm
+  "Train a GSDM on fresh examples of `problem` with the compiled batched
+  train step (Adam). Options: :config (`make-gsdm-config`), :batch (32),
+  :steps, :lr (1e-3), :betas (the noise schedule), :mask-mix, :seed,
+  :max-grad-norm (1.0), :max-marginalized (0: each batch marginalizes k
+  uniform on 0..max variables per example), :ema-rate (0.999), :train-step
+  (a compiled step to reuse). Returns {:weights :ema-weights (both flat, for
+  `gsdm-sample`; sample with the EMA) :losses :train-step}."
+  [problem {:keys [config batch steps lr betas mask-mix seed max-grad-norm train-step max-marginalized ema-rate]
+            :or {batch 32 lr 1e-3 mask-mix default-mask-mix seed 0 max-grad-norm 1.0 max-marginalized 0
+                 ema-rate 0.999}}]
+  (let [{:keys [n-layers emb-dim n-heads n-spaces]} config
+        weights (init-gsdm-weights config)
+        w (flat->tree weights n-layers)
+        ts (or train-step
+               (rp/compile-train-step (make-gsdm-batched-loss {:n-layers n-layers :emb-dim emb-dim
+                                                               :n-heads n-heads :n-spaces n-spaces})))
+        state ((:init-state ts) w)
+        train-fn (:train-fn ts)
+        alphas-cumprod (diff/compute-alphas-cumprod betas)
+        rng (java.util.Random. (long seed))
+        ema (into {} (map (fn [[k a]] [k (aclone ^doubles a)])) weights)
+        ;; the EMA of every weight array, with the usual warm-up of its rate
+        update-ema! (fn [step]
+                      (let [mu (min (double ema-rate) (/ (+ 1.0 step) (+ 10.0 step)))]
+                        (doseq [[k e] ema]
+                          (ema-update! e (get weights k) mu (- 1.0 mu) (alength ^doubles e)))))
+        losses (vec (for [step (range 1 (inc steps))]
+                      (let [loss (apply train-fn w (:m state) (:v state)
+                                        (concat (training-batch problem batch alphas-cumprod mask-mix emb-dim rng
+                                                                (.nextInt rng (inc (int max-marginalized))))
+                                                [(double max-grad-norm) (double lr) 0.9 0.999 1e-8 step]))]
+                        (update-ema! step)
+                        loss)))]
+    ;; the tree shares the flat map's arrays, which Adam updated in place
+    {:weights weights :ema-weights ema :losses losses :train-step ts}))

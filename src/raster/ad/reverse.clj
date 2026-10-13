@@ -1134,10 +1134,21 @@
   representation; the latter must not allocate a closure per iteration."
   [bindings body-exprs active-params dy-sym]
   (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
+        ;; The pullback's dy is the cotangent of the body value: same dtype as
+        ;; the primal (Pi invariant — cf. branch_dy's stamp from sym). Fill a
+        ;; missing stamp from the body's so late-cleanup resolves numeric calls
+        ;; over dy; a present stamp (e.g. branch_dy) is never overwritten.
+        dy-sym (if (and (symbol? dy-sym)
+                        (nil? (:raster.type/tag (meta dy-sym)))
+                        (:raster.type/tag (meta body-sym)))
+                 (vary-meta dy-sym assoc :raster.type/tag
+                            (:raster.type/tag (meta body-sym)))
+                 dy-sym)
         {:keys [fwd-bindings rev-ctx param-adj-syms]}
         (process-bindings norm-bindings active-params
                           {:seed-adj-env {body-sym [dy-sym]}})]
     {:body-sym body-sym
+     :dy-sym dy-sym
      :fwd-bindings fwd-bindings
      :rev-bindings (vec (:bindings rev-ctx))
      :param-adj-syms param-adj-syms}))
@@ -1146,11 +1157,16 @@
   "Generate reverse-mode AD code for a let* form: normalize → process-bindings →
   assemble [primal, pullback-fn]."
   [bindings body-exprs active-params]
-  (let [dy-sym 'dy__rad
-        {:keys [body-sym fwd-bindings rev-bindings param-adj-syms]}
-        (let-gradient-pieces bindings body-exprs active-params dy-sym)
+  (let [{:keys [body-sym dy-sym fwd-bindings rev-bindings param-adj-syms]}
+        (let-gradient-pieces bindings body-exprs active-params 'dy__rad)
         pullback-body (list 'let* rev-bindings (vec param-adj-syms))
-        pullback-fn   (list 'fn* [dy-sym] pullback-body)
+        ;; Link the pullback to its primal value: the body's cotangent dtype
+        ;; is the body's dtype, but the body's tag is often settled only by
+        ;; later inference (tag-binding-types). The symbolic link lets
+        ;; late-cleanup seed dy from the settled tag — no guessing at emission.
+        pullback-fn (cond-> (list 'fn* [dy-sym] pullback-body)
+                      (symbol? body-sym)
+                      (vary-meta assoc :raster.ad/cotangent-of body-sym))
         result-sym    (ad-gensym "result")
         augmented-bindings (vec (concat fwd-bindings [result-sym body-sym]))]
     (list 'let* augmented-bindings (vector result-sym pullback-fn))))
@@ -1161,9 +1177,9 @@
   evaluated in that loop iteration and the result is the ordered gradient
   vector for `active-params`."
   [bindings body-exprs active-params adjoint]
-  (let [dy-sym (ad-gensym "step_dy")
-        {:keys [fwd-bindings rev-bindings param-adj-syms]}
-        (let-gradient-pieces bindings body-exprs active-params dy-sym)]
+  (let [{:keys [dy-sym fwd-bindings rev-bindings param-adj-syms]}
+        (let-gradient-pieces bindings body-exprs active-params
+                             (ad-gensym "step_dy"))]
     (list 'let* (vec (concat fwd-bindings [dy-sym adjoint] rev-bindings))
           (vec param-adj-syms))))
 
@@ -3956,6 +3972,13 @@
 
           ;; === Phases 1-3: the shared pure engine (no atoms) ===
           dy-sym 'dy__rad
+          ;; The pullback's dy is the cotangent of the body value: same dtype
+          ;; as the primal (Pi invariant). Stamp it so downstream resolution
+          ;; and closure typing see the dtype (cf. let-gradient-pieces).
+          dy-sym (if (:raster.type/tag (meta body-sym))
+                   (vary-meta dy-sym assoc :raster.type/tag
+                              (:raster.type/tag (meta body-sym)))
+                   dy-sym)
           {:keys [fwd-bindings rev-ctx param-adj-syms]}
           (process-bindings norm-bindings active-params {:seed-adj-env {body-sym [dy-sym]}})
 

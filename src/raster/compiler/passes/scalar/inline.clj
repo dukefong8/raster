@@ -1875,6 +1875,58 @@
                   idx (resolve-dispatch-walk map-extent env) (vec folds')
                   (mapv #(resolve-dispatch-walk % fold-env) map-results))]
       (if-let [m (meta expr)] (with-meta r m) r))
+    ;; fn*: thread closure param stamps (AD pullback dy, loop-lifted fns)
+    ;; into clause bodies, with correct lexical shadowing (every param is
+    ;; assoc'd; a nil stamp masks an outer same-named entry like the let/loop
+    ;; branches and the walker). A :raster.ad/cotangent-of link on the form
+    ;; (pullback dy mirrors its primal's settled tag) fills an otherwise
+    ;; untagged first param. Argv vectors are kept verbatim so stamps survive.
+    ;; Handles raw (fn* [argv] body...) and walker-normalized
+    ;; (fn* ([argv] body...) ...) plus optional names.
+    (and (seq? expr) (= 'fn* (first expr)))
+    (let [args (rest expr)
+          fname (when (symbol? (first args)) (first args))
+          clauses (if fname (rest args) args)
+          ;; Late-settled primal tag behind the cotangent link, if any.
+          ;; Env-only: never var-ref fallback (a user-named body sym must
+          ;; not resolve against the compiler's own ns).
+          link-tag (when-let [link (:raster.ad/cotangent-of (meta expr))]
+                     (when (and (symbol? link) (contains? env link))
+                       (inf/infer-arg-tag link env)))
+          seed (fn [e argv]
+                 ;; Every param is assoc'd: a nil stamp masks an outer
+                 ;; same-named entry, exactly like the let/loop branches and
+                 ;; the walker (nested pullbacks all name their param dy__rad,
+                 ;; and an inner dy is a DIFFERENT variable from an outer one).
+                 (let [e (reduce (fn [acc p]
+                                   (assoc acc p (inf/hint-tag p)))
+                                 e argv)]
+                   ;; The link fills a missing first-param stamp only.
+                   (if (and link-tag (seq argv)
+                            (nil? (inf/hint-tag (first argv))))
+                     (assoc e (first argv) link-tag)
+                     e)))
+          walk-bodies (fn [cenv bodies]
+                        (map #(resolve-dispatch-walk % cenv) bodies))]
+      (if (vector? (first clauses))
+        (let [r (apply list 'fn*
+                       (cond-> []
+                         fname (conj fname)
+                         true (conj (first clauses)))
+                       (walk-bodies (seed env (first clauses)) (rest clauses)))]
+          (if-let [m (meta expr)] (with-meta r m) r))
+        (let [new-clauses
+              (mapv (fn [clause]
+                      (if (and (seq? clause) (vector? (first clause)))
+                        (with-meta
+                          (apply list (first clause)
+                                 (walk-bodies (seed env (first clause))
+                                              (rest clause)))
+                          (meta clause))
+                        (resolve-dispatch-walk clause env)))
+                    clauses)
+              r (apply list 'fn* (concat (when fname [fname]) new-clauses))]
+          (if-let [m (meta expr)] (with-meta r m) r))))
     ;; Qualified symbol call: try dispatch resolution then recurse into args
     (and (symbol? (first expr)) (namespace (first expr)))
     (let [;; First recurse into args so nested calls get resolved

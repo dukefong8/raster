@@ -51,15 +51,22 @@
     raster.compiler.pe-test raster.compiler.pipeline-extractor-test raster.compiler.pipeline-test raster.compiler.recur-lub-test
     raster.compiler.report-test raster.compiler.required-jit-walk-test raster.compiler.review-regression-test raster.compiler.segop-boundary-test
     raster.compiler.simplify-test raster.compiler.specialization-return-test raster.compiler.valhalla-test raster.core-test
-    raster.deftm-tree-compose-test raster.dl.diffusion-test raster.dl.loss-test raster.dl.norm-ad-test
-    raster.dl.optim-test raster.dl.scatter-test raster.gpu.device-probe-test raster.gpu.ze-runtime-test
-    raster.hardware-fixture-test raster.linalg.blas-test raster.linalg.core-test raster.linalg.dense-test
-    raster.linalg.native-library-test raster.math-test raster.numeric-test raster.par-contract-test
+    raster.deftm-tree-compose-test raster.dl.array-ops-test raster.dl.diffusion-test raster.dl.einsum-test
+    raster.dl.loss-test raster.dl.nn-test raster.dl.norm-ad-test raster.dl.optim-test
+    raster.dl.scatter-test raster.ga.core-test raster.gpu.device-probe-test raster.gpu.ze-runtime-test
+    raster.hardware-fixture-test raster.linalg.blas-test raster.linalg.contract-test raster.linalg.core-test
+    raster.linalg.dense-test raster.linalg.eigen-test raster.linalg.iterative-test raster.linalg.native-library-test
+    raster.linalg.pca-test raster.linalg.qr-test raster.linalg.sparse-csr-test raster.linalg.sparse-test
+    raster.linalg.svd-test raster.math-test raster.numeric-test raster.ode.core-test
+    raster.ode.pde-test raster.ode.sde-test raster.ode.sensitivity-test raster.par-contract-test
     raster.par-gather-test raster.par-scatter-test raster.par-test raster.params-e2e-mlp-test
     raster.params-test raster.polymorphic-scalar-dtype-test raster.render.shader-test raster.runtime.native-abi-test
-    raster.runtime.native-call-test raster.sci.special-test raster.shape-test raster.spatial.nndescent-test
-    raster.sym.core-test raster.types.complex-test raster.types.float-test raster.types.hierarchy-test
-    raster.types.int8-test raster.types.number-types-test raster.types.promote-test raster.types.traits-test])
+    raster.runtime.native-call-test raster.sci.distributions-test raster.sci.fft-test raster.sci.interpolation-test
+    raster.sci.optim-test raster.sci.quadrature-test raster.sci.roots-test raster.sci.special-test
+    raster.sci.stats-test raster.shape-test raster.spatial.nndescent-test raster.sym.core-test
+    raster.sym.fn-algebra-test raster.sym.taylor-ext-test raster.sym.taylor-test raster.types.complex-test
+    raster.types.float-test raster.types.hierarchy-test raster.types.int8-test raster.types.number-types-test
+    raster.types.promote-test raster.types.traits-test])
 
 (defn- run-one [ns-sym]
   (let [load-err (try (require ns-sym) nil (catch Throwable e (str (ex-message e))))]

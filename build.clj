@@ -68,83 +68,81 @@
 ;; asserted, not assumed (see `lean-closure-gaps!`).
 
 (def lean-entry-namespaces
-  "Roots that define the packaged user surface: the JVM/bytecode path, WASM emission, and the
-  cljs↔wasm build half (the browser vertical)."
-  '[raster.core
-    raster.arrays
-    raster.par
+  "Roots of the packaged user surface, grouped like src/raster/. The closure
+  is DERIVED (transitive static requires), so this list names entry points,
+  not files. gpu/ and vk/ ship nothing (see exclusions below)."
+  '[;; Foundations: macros (core), numeric tower (numeric/math), arrays, par.
+    raster.core raster.numeric raster.math raster.arrays raster.par
+    ;; ad/: reverse + forward AD.
     raster.ad
     raster.ad.reverse
-    raster.linalg.blas
-    raster.linalg.lapack
-    raster.linalg.core
-    raster.noise
-    raster.runtime.hardware
-    raster.runtime.callsites
+    ;; compiler/: pipeline, backends that ship (JVM/bytecode, WASM, WGSL,
+    ;; C-SIMD/C-emit, native-C toolchain, TC extensions).
     raster.compiler.pipeline
-    ;; JVM backend family: the bytecode/Vector-API backends arrive through pipeline's pass
-    ;; references; the typed-scalar reference runner has no static consumer on the lean path
-    ;; (it is reached via compiler.equation-first, a GPU-side namespace), so name it explicitly.
     raster.compiler.backend.jvm.typed-scalar
     raster.compiler.cljs-emit
     raster.compiler.backend.wasm.emit
-    ;; WebGPU compute emitter — the browser compute backend. It is a member of
-    ;; the otherwise-excluded backend.gpu family (see `excluded-family-exceptions`), shipped so
-    ;; the public `compile-wgsl` entry resolves in a lean deployment.
     raster.compiler.backend.gpu.wgsl
-    ;; CPU-SIMD lane emitter + the shared C-expression emitter it builds on. Members of
-    ;; the otherwise-excluded backend.cpu/backend.gpu families (see
-    ;; `excluded-family-exceptions`): pure source-to-source emitters over the middle
-    ;; end (no native toolchain at load), shipped so backend-agnostic tests
-    ;; (inline-pure-lets) execute rather than skip on lean deployments.
     raster.compiler.backend.cpu.csimd
     raster.compiler.backend.gpu.c-emit
-    ;; Native-C quantization formats + the C backend they share: pure data + source
-    ;; emission (the C compiler only runs if a test explicitly shells out to one).
-    ;; Shipped so the csimd quantization tests execute on lean deployments.
     raster.compiler.backend.cpu.quant
     raster.compiler.backend.cpu.codegen
-    ;; Native-C AOT pipeline (C source + build-script generation over the same
-    ;; emitters; no compiler invocation at load). Completes the backend.cpu
-    ;; family in the jar — csimd-test needs it.
     raster.compiler.backend.cpu.aot
-    ;; The compiler's effect-classification pass consults raster.dl.loss at load time to
-    ;; register the pure forward loss reductions (mse/cross-entropy/huber/l1). Shipping it keeps
-    ;; those registrations — and their DCE benefit — available, and silences the warn-only
-    ;; fallback a lean deployment would otherwise print on the first compile.
+    raster.compiler.core.tc-extensions
+    ;; ode/: solvers + AMR companions (execution/lowering/state stay OUT: GPU refs).
+    raster.ode.core
+    raster.ode.pde
+    raster.ode.sde
+    raster.ode.amr-transfer
+    raster.ode.finite-volume
+    raster.ode.multilevel
+    ;; linalg/: LAPACK-via-Panama BLAS/LAPACK/core plus pure factorizations.
+    raster.linalg.blas
+    raster.linalg.lapack
+    raster.linalg.core
+    raster.linalg.sparse
+    raster.linalg.contract
+    raster.linalg.eigen
+    raster.linalg.iterative
+    raster.linalg.pca
+    raster.linalg.qr
+    raster.linalg.svd
+    ;; sci/: roots/optim/quadrature/interpolation/fft/distributions/stats.
+    raster.sci.roots
+    raster.sci.optim
+    raster.sci.quadrature
+    raster.sci.interpolation
+    raster.sci.fft
+    raster.sci.distributions
+    raster.sci.stats
+    ;; dl/: losses, diffusion, array primitives, attention, einsum.
     raster.dl.loss
-    ;; Diffusion noise schedules: pure deftm over core/arrays/math/numeric/par (all already
-    ;; in the closure, so this adds exactly one namespace). Required by compiler tests
-    ;; loadable against the lean jar (devirtualization-test).
     raster.dl.diffusion
-    ;; Approximate kNN via NN-descent (+ its RP-tree/tausworthe/knn helpers, all pure
-    ;; deftm over the same core surface — four namespaces total, no backend deps).
-    ;; Required by compiler tests loadable against the lean jar (devirtualization-test).
-    raster.spatial.nndescent
-    ;; Value-type tower: complex/int8/number-types/traits (+ ga.core, pulled by complex
-    ;; for the Clifford import — ga.core itself is pure deftm over core/numeric/arrays
-    ;; plus the already-shipped algebraic-types; the Valhalla code generator
-    ;; ga/compile is deliberately NOT shipped).
-    ;; algebraic-types/promote already arrive transitively. Required by the
-    ;; raster.types.* tests loadable against the lean jar.
+    raster.dl.array-ops
+    raster.dl.gsdm
+    raster.dl.einsum
+    ;; nn: dense-layer library (examples/notebooks).
+    raster.nn
+    ;; sym/: function algebra + Taylor series.
+    raster.sym.fn-algebra
+    raster.sym.taylor
+    ;; ga/: multivector core arrives via types.complex; compile ships too
+    ;; (needs a Valhalla-capable JVM at use time, not at load).
+    raster.ga.compile
+    ;; types/: complex/int8/number-types/traits (algebraic-types/promote
+    ;; arrive transitively).
     raster.types.complex
     raster.types.int8
     raster.types.number-types
     raster.types.traits
+    ;; Supporting surface: noise, runtime probes, kNN, inspect, params, WebGPU.
+    raster.noise
+    raster.runtime.hardware
+    raster.runtime.callsites
+    raster.spatial.nndescent
     raster.tooling.inspect
     raster.params
-    ;; Browser WebGPU backend (.cljs). Its only external dep is
-    ;; applied-science/js-interop (a cljs library, not a raster source file).
-    raster.render.webgpu
-    ;; Raster's TypedClojure checker extensions: pure Clojure over the
-    ;; org.typedclojure libs (zero raster deps — one namespace). Inference loads
-    ;; them LAZILY via a bare runtime `(require ...)` inside a delay, which the
-    ;; static closure derivation cannot see (it only scans `:require` clauses
-    ;; plus requiring-resolve/resolve). Without it, tc-analyze-deftm-body
-    ;; swallows the FileNotFound and returns nil tags — silently degrading typed
-    ;; inference (and its devirtualization benefit) exactly like the dl.loss
-    ;; case above. Caught by inference-test on a lean deployment.
-    raster.compiler.core.tc-extensions])
+    raster.render.webgpu])
 
 (def ^:private excluded-family-prefixes
   "Namespace prefixes the lean closure must never reach: the compute GPU stack

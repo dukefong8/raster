@@ -62,8 +62,7 @@
   (:require [raster.core :refer [deftm ftm]]
             [raster.numeric :as n]
             [raster.abm.firms :as firms]
-            [raster.abm.firms.econ :as econ]
-            [scicloj.kindly.v4.kind :as kind])
+            [raster.abm.firms.econ :as econ])
   (:import [raster.abm.firms FirmsConfig AgentSoA FirmSoA]))
 
 ;; ## The Economic Model
@@ -85,7 +84,7 @@
 (let [a 0.5, b 0.3, beta 1.5
       efforts (mapv #(* 0.1 %) (range 1 101))
       outputs (mapv #(econ/production a b beta (double %)) efforts)]
-  (kind/vega-lite
+  (identity
    {:$schema "https://vega.github.io/schema/vega-lite/v5.json"
     :width 500 :height 300
     :title "Production Function: Y = a·E + b·E^β"
@@ -130,7 +129,7 @@
       others-efforts (mapv #(* 0.1 %) (range 0 21))
       own-efforts (mapv #(econ/solve-effort a b beta (double %) theta endow)
                         others-efforts)]
-  (kind/vega-lite
+  (identity
    {:$schema "https://vega.github.io/schema/vega-lite/v5.json"
     :width 500 :height 300
     :title "Free-Rider Effect: Own Effort vs. Others' Effort"
@@ -257,7 +256,7 @@
 ;; The number of active firms evolves as agents start new firms and
 ;; abandon failing ones:
 
-(kind/vega-lite
+(identity
  {:$schema "https://vega.github.io/schema/vega-lite/v5.json"
   :width 600 :height 300
   :title "Active Firms Over Time"
@@ -270,7 +269,7 @@
 
 ;; Even with 1000 agents, some firms grow significantly larger than others:
 
-(kind/vega-lite
+(identity
  {:$schema "https://vega.github.io/schema/vega-lite/v5.json"
   :width 600 :height 300
   :title "Maximum Firm Size Over Time"
@@ -281,7 +280,7 @@
 
 ;; ### Mean Effort and Income
 
-(kind/vega-lite
+(identity
  {:$schema "https://vega.github.io/schema/vega-lite/v5.json"
   :width 600 :height 300
   :title "Mean Effort and Income"
@@ -308,7 +307,7 @@
                        :when (> (clojure.core/aget alive i) 0)]
                    (clojure.core/aget n-workers i))
       size-freq (frequencies firm-sizes)]
-  (kind/vega-lite
+  (identity
    {:$schema "https://vega.github.io/schema/vega-lite/v5.json"
     :width 600 :height 350
     :title "Firm Size Distribution (log-log)"

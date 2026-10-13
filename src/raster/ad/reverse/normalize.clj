@@ -96,6 +96,20 @@
         (swap! result conj sym normalized)))
     @result))
 
+(defn- if-result-tag
+  "Agreed :raster.type/tag of an if's then/else arm symbols, or nil.
+   Walker type evidence lives on binder syms, never on the if FORM — so a
+   fresh body sym minted for an if body must inherit its arms' tag here.
+   Otherwise downstream AD emission sees an untagged value whose dtype was
+   known all along (runtime zero-like fallback, unresolved dy arithmetic)."
+  [body-expr]
+  (when (and (seq? body-expr) (= 'if (first body-expr)))
+    (let [[_ _ then else] body-expr]
+      (when (and (symbol? then) (symbol? else))
+        (let [tt (:raster.type/tag (meta then))
+              et (:raster.type/tag (meta else))]
+          (when (and tt (= tt et)) tt))))))
+
 (defn normalize-for-ad
   "Normalize a let form for uniform AD processing.
   Input: flat bindings vector [s1 e1 s2 e2 ...], body-exprs list, gensym-fn.
@@ -113,7 +127,9 @@
                     (cons 'do body-exprs))
         [extras normalized] (anf-normalize-expr body-expr gensym-fn)
         body-sym (if (symbol? normalized) normalized
-                     (with-meta (gensym-fn "body") (meta body-expr)))]
+                     (let [tag (if-result-tag normalized)]
+                       (cond-> (with-meta (gensym-fn "body") (meta body-expr))
+                         tag (vary-meta assoc :raster.type/tag tag))))]
     [(cond-> (into (vec anf-bindings) extras)
        (not (symbol? normalized)) (into [body-sym normalized]))
      body-sym]))
